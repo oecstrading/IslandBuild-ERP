@@ -193,6 +193,7 @@
         <span class="ai-badge"><span class="dot"></span>AI Accountant</span>
         <span id="coName">IslandBuild Construction & Equipment Ltd</span>
         <span id="todayLbl"></span>
+        <span id="sampleAccess"></span>
       </div>
     </header>
     <select class="inp" id="mobileNav" aria-label="Navigate to module" onchange="go(this.value)"></select>
@@ -207,7 +208,8 @@
 /* ==========================================================================
    ISLANDBUILD ERP — Single-file accounting + rental ERP + DeepSeek AI
    ========================================================================== */
-const DB_KEY = 'islandbuild_erp_v1';
+const DEMO_WORKSPACE = /(?:^|[?&])demo=1(?:&|$)/.test(window.location?.search || '');
+const DB_KEY = DEMO_WORKSPACE ? 'islandbuild_erp_sample_workspace_v1' : 'islandbuild_erp_v1';
 let db = null;
 let route = 'dashboard';
 const ui = { cart: [], posFilter: '', search: {}, aiPending: null };
@@ -305,7 +307,7 @@ function acctBalance(code, asOf) {
 function accountsByType(type) { return (db.accounts || []).filter(a => a.type === type).sort((a, b) => a.code.localeCompare(b.code)); }
 
 /* ============================= SEED DATA =============================== */
-function seedDatabase() {
+function seedDatabase(includeProjects=false) {
   db = {
     company: {
       name: 'IslandBuild Construction & Equipment Ltd',
@@ -430,6 +432,7 @@ function seedDatabase() {
 
   payInvoice(db.invoices[0].id, 3000, dayShift(-10), '1010');
   payBill(db.bills[0].id, 2000, dayShift(-8), '1010');
+  if (includeProjects) seedConstructionDemo();
   return db;
 }
 
@@ -743,6 +746,7 @@ function render() {
     document.getElementById('coName').textContent = db.company.name;
     document.getElementById('todayLbl').textContent = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
     document.getElementById('brandSub').textContent = 'St. Lucia · ' + (db.company.currency || 'XCD');
+    document.getElementById('sampleAccess').innerHTML=demoAccess();
     renderNav();
     document.getElementById('mobileNav').innerHTML = NAV.filter(n => n.id).map(n =>
       `<option value="${n.id}" ${route === n.id ? 'selected' : ''}>${n.label}</option>`).join('');
@@ -1931,7 +1935,7 @@ function importBackup(input) {
 }
 function resetDemo() {
   if (!confirm('Erase ALL data and reload demo company?')) return;
-  atomic(seedDatabase); ui.cart = []; render(); toast('Demo data reloaded', 'ok');
+  atomic(()=>seedDatabase(true)); ui.cart = []; render(); toast('Demo data reloaded', 'ok');
 }
 
 /* ============================= MODAL HELPERS =============================== */
@@ -1947,9 +1951,9 @@ function closeModal() { const root = document.getElementById('modalRoot'); root.
    ██  AI ACCOUNTANT ASSISTANT  ██
    ========================================================================== */
 
-const AI_KEY_STORE = 'islandbuild_ai_key';
-const AI_BASE_STORE = 'islandbuild_ai_base';
-const AI_CHAT_STORE = 'islandbuild_ai_chat';
+const AI_KEY_STORE = DEMO_WORKSPACE ? 'islandbuild_ai_key_sample' : 'islandbuild_ai_key';
+const AI_BASE_STORE = DEMO_WORKSPACE ? 'islandbuild_ai_base_sample' : 'islandbuild_ai_base';
+const AI_CHAT_STORE = DEMO_WORKSPACE ? 'islandbuild_ai_chat_sample' : 'islandbuild_ai_chat';
 
 const AI = {
   apiKey: '',
@@ -3410,6 +3414,15 @@ function chronologicalJobDate(p) {
   return [p.contract?.date,p.signoff?.date,p.finalAccount?.date,...(p.variations||[]).map(v=>v.date),
     ...db.invoices.filter(i=>i.projectId===p.id).map(i=>i.date)].filter(Boolean).sort().at(-1) || '';
 }
+function postRetentionRelease(p, {date,dueDate,ref,amount,note}) {
+  const invoice={id:nextNo('INV-','inv'),customerId:p.customerId,projectId:p.id,date,dueDate,notes:note,
+    source:'Retention Release',certificateRef:ref,lines:[{desc:'Release of retention · '+ref,qty:1,rate:amount,amount}],
+    subtotal:0,hsl:0,vat:0,vatBase:0,total:amount,paid:0,status:'Open'};
+  post(date,'Construction retention released · '+ref,invoice.id,'Retention Release',
+    [{code:'1100',debit:amount},{code:RETENTION_ACCOUNT,credit:amount}]);
+  db.invoices.push(invoice);
+  return invoice;
+}
 function saveJobAction(id, action) {
   const p=job(id);
   requireValue(p && !p.closed,'This project is closed.');
@@ -3468,12 +3481,7 @@ function saveJobAction(id, action) {
       const refs=new Set(f.invoices.map(i=>i.id));
       requireValue(!db.payments.some(payment=>refs.has(payment.ref) && payment.date>date),
         'The retention release date must be on or after settlement of the project invoices.');
-      const invoice={id:nextNo('INV-','inv'),customerId:p.customerId,projectId:p.id,date,dueDate:due,notes:note,
-        source:'Retention Release',certificateRef:ref,lines:[{desc:'Release of retention · '+ref,qty:1,rate:amount,amount}],
-        subtotal:0,hsl:0,vat:0,vatBase:0,total:amount,paid:0,status:'Open'};
-      post(date,'Construction retention released · '+ref,invoice.id,'Retention Release',
-        [{code:'1100',debit:amount},{code:RETENTION_ACCOUNT,credit:amount}]);
-      db.invoices.push(invoice);
+      postRetentionRelease(p,{date,dueDate:due,ref,amount,note});
     } else if (action==='close') {
       const bills=db.bills.filter(b=>b.projectId===id);
       requireValue(f.phase==='Ready to close' && bills.every(b=>billDue(b)===0),'Collect all invoices and retention, and settle all linked vendor bills before closing.');
@@ -3753,7 +3761,7 @@ function viewPerformance() {
   const active=projects.filter(x=>!x.p.closed && x.p.status!=='Complete').length;
   const behind=projects.filter(x=>!x.p.closed && x.evm.spi!=null && x.evm.spi<1).length;
   const over=projects.filter(x=>!x.p.closed && x.evm.cpi!=null && x.evm.cpi<1).length;
-  return tabBar+`${tab==='business'?`<div class="card"><div class="card-h"><h3>Business performance</h3>
+  return `<div style="margin-bottom:12px">${demoAccess()}</div>`+tabBar+`${tab==='business'?`<div class="card"><div class="card-h"><h3>Business performance</h3>
       <label>Reporting month <input class="inp" type="month" value="${esc(month)}" onchange="ui.performanceMonth=this.value;render()"></label></div>
     <div class="card-b"><div class="grid g4">${[
       ['revenue',money(data.revenue)],['expense',money(data.expense)],['profit',money(data.profit)],
@@ -4017,6 +4025,109 @@ function evmPerformanceMetric(key,id,packageId) {
     ()=>evmPerformanceMetric(key,id,packageId));
 }
 
+/* Fictional project scenarios, created only in demo data. */
+function seedConstructionDemo() {
+  db.demoScenarios = true;
+  db.company.hslEnabled=true;
+  db.company.hslRate=2.5;
+  db.company.hslInVat=true;
+  const dates=dayShift;
+  const configs=[
+    {id:'JOB-DEMO-01', name:'Castries Clinic Extension', customerId:'CUST-001', ref:'DEMO-CLINIC',
+      start:-55, originalFinish:31, finish:40, budget:102000, contingency:7000, value:145000,
+      variation:{amount:12000,budgetChange:8000,note:'Client-approved accessible entry and drainage changes.'},
+      sign:false, terms:{site:'Castries',manager:'Demo site manager',etc:73000},
+      tasks:[['Site works',-55,-36,19000,100],['Structure',-35,0,43000,70],['Building services',-12,22,25000,20],['Handover',23,40,16000,0]],
+      claim:60000, invoiceDay:-15,bill:55000,payment:32000,vendorPayment:28000},
+    {id:'JOB-DEMO-02',name:'Rodney Bay Villa Refurbishment',customerId:'CUST-002',ref:'DEMO-VILLA',
+      start:-38,originalFinish:28,finish:28,budget:85000,contingency:5000,value:120000,
+      sign:false,terms:{site:'Rodney Bay',manager:'Demo project lead',etc:39000,billing:'Accepted milestones'},
+      tasks:[['Strip-out and survey',-38,-22,15000,100],['Envelope repairs',-21,12,42000,85],['Fit-out and inspection',13,28,23000,15]],
+      claim:26000,invoiceDay:0,bill:40000,payment:21000,vendorPayment:20000},
+    {id:'JOB-DEMO-03',name:'Vieux Fort Workshop Upgrade',customerId:'CUST-004',ref:'DEMO-WORKSHOP',
+      start:-110,originalFinish:-49,finish:-49,budget:39000,contingency:3000,value:58000,sign:true,
+      terms:{site:'Vieux Fort',manager:'Demo contracts administrator',defectsDays:30,retentionDays:7},
+      tasks:[['Civil works',-110,-83,14000,100],['Equipment installation',-82,-57,16000,100],['Testing and handover',-56,-49,6000,100]],
+      claim:36000,invoiceDay:-67,bill:33500,vendorPayment:33500}
+  ];
+  db.projects ||= [];
+  for (const c of configs) {
+    const p={id:c.id,name:c.name,customerId:c.customerId,start:dates(c.start),due:dates(c.originalFinish),budget:c.budget,
+      status:'Active',scope:'Fictional training project with sample contract, schedule and accounting records.',
+      terms:{contingency:c.contingency,billing:'Progress certificates',paymentDays:14,retentionDays:14,defectsDays:30,
+        taxable:true,hsl:true,clientRep:'Demo client certifier',deliverables:c.tasks.map(t=>t[0]).join('; '),
+        acceptance:'Signed inspection and handover evidence.',risks:'Monitor lead times and approve changes before spending.',...c.terms},tasks:[]};
+    db.projects.push(p);
+    approveProjectContract(p,{ref:c.ref,date:p.start,note:'Sample signed contract',value:c.value,rate:5,cap:c.value*.05});
+    if (c.variation) {
+      p.variations=[{...c.variation,ref:c.ref+'-VO1',date:dates(-25),previousDue:p.due,revisedDue:dates(c.finish)}];
+      p.due=dates(c.finish);
+      p.budget+=c.variation.budgetChange;
+    }
+    const packages=c.tasks.map(([name,start,finish,budget,percent],i)=>{
+      const id=c.id+'-W'+(i+1);
+      const milestone=p.terms.billing==='Accepted milestones' && i===0;
+      p.tasks.push({id,name,owner:p.terms.manager,due:dates(finish),status:percent===100?'Done':percent?'In Progress':'To Do',
+        billingValue:milestone?c.claim:0,acceptanceRef:milestone?c.ref+'-ACC1':''});
+      return {id,name,start:dates(start),finish:dates(finish),budget};
+    });
+    const progressDate=dates(c.sign?-49:-1), evidence=c.ref+'-INSPECTION';
+    p.evm={plans:[{ref:c.ref+'-BL1',date:c.variation?dates(-25):p.start,
+      reason:c.variation?'Baseline approved after accessible entry variation':'',
+      bac:p.budget-c.contingency,packages}],progress:{},updates:[]};
+    const changes=packages.flatMap((w,i)=>{
+      const percent=c.tasks[i][4];
+      if (!percent) return [];
+      p.evm.progress[w.id]={date:progressDate,percent,evidence};
+      return [{id:w.id,previous:0,percent}];
+    });
+    p.evm.updates.push({date:progressDate,baseline:p.evm.plans[0].ref,evidence,changes});
+    const invoice=(amount,day,final=false)=>{
+      const ref=c.ref+(final?'-FINAL':'-PC1'),date=dates(day);
+      return createInvoice({customerId:p.customerId,projectId:p.id,date,dueDate:jobDatePlus(date,p.terms.paymentDays),
+        source:final?'Construction Final':'Construction Progress',certificateRef:ref,retentionHeld:jobRetention(p,amount),
+        milestoneId:p.terms.billing==='Accepted milestones'&&!final?p.tasks[0].id:undefined,
+        lines:[{desc:'Certified construction work · '+ref,qty:1,rate:amount,taxable:true,hslEligible:true,revAcct:'4000'}]});
+    };
+    const progress=invoice(c.claim,c.invoiceDay);
+    const billDate=dates(c.sign?-78:c.invoiceDay===0?0:-12);
+    const bill=createBill({vendorId:'VEND-003',projectId:p.id,date:billDate,dueDate:jobDatePlus(billDate,14),
+      lines:[{desc:'Certified subcontract work · '+c.ref,qty:1,rate:c.bill,taxable:false,acct:'5200'}]});
+    payBill(bill.id,c.vendorPayment,dates(c.sign?-60:c.invoiceDay===0?0:-4),'1010');
+    if (c.sign) {
+      payInvoice(progress.id,invoiceDue(progress),dates(-58),'1010');
+      p.signoff={ref:c.ref+'-SIGN',date:dates(-49),releaseDate:dates(-19),person:p.terms.clientRep,note:'Handover accepted.'};
+      const final=invoice(c.value-c.claim,-48,true);
+      p.finalAccount={ref:final.certificateRef,date:final.date,invoiceId:final.id};
+      payInvoice(final.id,invoiceDue(final),dates(-36),'1010');
+      const release=postRetentionRelease(p,{date:dates(-18),dueDate:dates(-11),ref:c.ref+'-REL1',
+        amount:jobCommercial(p).held,note:'Defects inspection accepted.'});
+      payInvoice(release.id,invoiceDue(release),dates(-10),'1010');
+      p.closed={ref:c.ref+'-CLOSE',date:dates(-9),note:'All invoices, suppliers and retention settled.'};
+      p.status='Complete';
+    } else {
+      payInvoice(progress.id,c.payment,dates(Math.max(c.invoiceDay,-2)),'1010');
+    }
+  }
+  const site=db.projects.find(p=>p.id==='JOB-DEMO-01');
+  const material=db.items.find(i=>i.id==='ITM-001');
+  const issueQty=20,amount=r2(issueQty*material.cost);
+  material.stockValue=r2(stockValue(material)-amount);
+  material.qty=r2(material.qty-issueQty);
+  material.cost=material.stockValue/material.qty;
+  material.reorder=material.qty+10;
+  post(dates(-2),'Demo materials issued · cement',site.id,'Job Materials',
+    [{code:'5000',debit:amount},{code:'1200',credit:amount}]);
+  const payroll=post(dates(-2),'Demo approved payroll · Castries Clinic','DEMO-PR-01','Caribbean Payroll',
+    [{code:'5100',debit:7500},{code:'2300',credit:7500}]);
+  payroll.lines[0].projectId=site.id;
+}
+function demoAccess() {
+  return DEMO_WORKSPACE
+    ? '<span class="pill info">Sample workspace</span> <a class="btn-sm" href="?">Return to main workspace</a>'
+    : '<a class="btn-sm" href="?demo=1" target="_blank" rel="noopener noreferrer">Open sample workspace</a>';
+}
+
 (function boot() {
   try {
     const raw = localStorage.getItem(DB_KEY);
@@ -4036,9 +4147,13 @@ function evmPerformanceMetric(key,id,packageId) {
       db.vendors = db.vendors || [];
       db.items = db.items || [];
     } else { 
-      atomic(seedDatabase); 
+      atomic(()=>seedDatabase(true)); 
     }
-    save(); 
+    if (DEMO_WORKSPACE) {
+      route='performance';
+      ui.performanceTab='evm';
+    }
+    save();
     render();
   } catch (err) {
     console.error('Boot error:', err);
