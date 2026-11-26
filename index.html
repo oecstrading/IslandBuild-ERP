@@ -429,6 +429,41 @@ function seedDatabase() {
 }
 
 /* ===================== TRANSACTION ENGINES ===================== */
+const HSL_ACCOUNT = '2115';
+function salesTaxes(lines, vatRate = db.company.vatRate) {
+  const hslRate = db.company.hslEnabled === true ? (db.company.hslRate ?? 2.5) : 0;
+  const hslInVat = db.company.hslInVat !== false;
+  let subtotal = 0, taxable = 0, levyBase = 0;
+  for (const line of lines) {
+    const cents = Math.round(r2(line.qty * line.rate) * 100);
+    subtotal += cents;
+    if (line.taxable === false) continue;
+    taxable += cents;
+    if (line.hslEligible === true) levyBase += cents;
+  }
+  const percent = (cents, rate) => Math.round(cents * Math.round(rate * 100) / 10000);
+  const levy = percent(levyBase, hslRate);
+  const vatBase = taxable + (hslInVat ? levy : 0);
+  const vat = percent(vatBase, vatRate);
+  return {subtotal:subtotal/100, hsl:levy/100, vatBase:vatBase/100,
+    vat:vat/100, total:(subtotal+levy+vat)/100, vatRate, hslRate, hslInVat};
+}
+function ensureHslAccount() {
+  if (!account(HSL_ACCOUNT)) db.accounts.push({code:HSL_ACCOUNT,name:'Health & Security Levy Payable',type:'Liability'});
+  requireValue(account(HSL_ACCOUNT).type === 'Liability' && account(HSL_ACCOUNT).name === 'Health & Security Levy Payable',
+    'Account 2115 is reserved for Health & Security Levy Payable.');
+}
+function invoiceTaxRows(inv, attrs = '', withIds = false) {
+  const fields = [
+    ['Subtotal', 'subtotal', 'invSub'],
+    [inv.hslRate ? 'HSL @ '+inv.hslRate+'%' : 'HSL', 'hsl', 'invHsl'],
+    ['Total for VAT', 'vatBase', 'invVatBase'],
+    [inv.vatRate === undefined ? 'VAT' : 'VAT @ '+inv.vatRate+'%', 'vat', 'invVat'],
+    ['Total Invoice', 'total', 'invTotal']
+  ];
+  return fields.filter(([,key])=>key!=='vatBase' || inv.vatBase !== undefined)
+    .map(([label,key,id])=>`<div ${attrs} ${key==='total'?'class="big"':''}><span>${label}</span><strong ${withIds?'id="'+id+'"':''}>${money(inv[key]||0)}</strong></div>`).join('');
+}
 function createInvoice(opt) {
   checkDocument(opt, db.customers, opt.customerId);
   const demand = new Map();
@@ -448,14 +483,17 @@ function createInvoice(opt) {
     dueDate: opt.dueDate || opt.date || today(), lines: opt.lines.map(l => ({ ...l })),
     subtotal: 0, vat: 0, total: 0, paid: 0, status: 'Open', source: opt.source || 'AR',
     projectId: opt.projectId || '', notes: opt.notes || '', rentalId: opt.rentalId || null };
-  let sub = 0, vat = 0;
-  inv.lines.forEach(l => { l.amount = r2(l.qty * l.rate); sub += l.amount; if (l.taxable !== false) vat += l.amount * (vatRate / 100); });
-  inv.subtotal = r2(sub); inv.vat = r2(vat); inv.total = r2(inv.subtotal + inv.vat);
+  inv.lines.forEach(l => { l.amount = r2(l.qty * l.rate); });
+  Object.assign(inv, salesTaxes(inv.lines, vatRate));
   const debitAcct = opt.paidNow ? (opt.payAccount || '1000') : '1100';
   const glLines = [{ code: debitAcct, debit: inv.total }];
   const revTotals = {};
   inv.lines.forEach(l => { const acct = l.revAcct || '4010'; revTotals[acct] = (revTotals[acct] || 0) + l.amount; });
   Object.entries(revTotals).forEach(([acct, amt]) => glLines.push({ code: acct, credit: r2(amt) }));
+  if (inv.hsl > 0) {
+    ensureHslAccount();
+    glLines.push({code:HSL_ACCOUNT,credit:inv.hsl});
+  }
   if (inv.vat > 0) glLines.push({ code: '2100', credit: inv.vat });
   post(inv.date, `Sales invoice ${inv.id} — ${customerName(inv.customerId)}`, inv.id, 'Sales', glLines);
   inv.lines.forEach(l => {
@@ -593,7 +631,7 @@ function returnRental(id, opt) {
     const rate = rentalRate(l, usedDays);
     rentalCharge += r2(rate * l.qty);
     invLines.push({ itemId: l.itemId, desc: `${item ? item.name : 'Equipment'} — ${usedDays} day(s), contracted rate`,
-      qty: l.qty, rate, taxable: true, revAcct: '4020', cogsAcct: '6200', cost: 0 });
+      qty: l.qty, rate, taxable: item?.taxable !== false, hslEligible: item?.hslEligible === true, revAcct: '4020', cogsAcct: '6200', cost: 0 });
   });
   let lateFee = 0;
   const latePct = rnt.lateFeePct ?? db.company.lateFeePct;
@@ -832,9 +870,8 @@ function viewPOS() {
   const sellable = (db.items || []).filter(i => i.type !== 'Rental');
   const f = (ui.posFilter || '').toLowerCase();
   const list = sellable.filter(i => !f || i.name.toLowerCase().includes(f) || i.sku.toLowerCase().includes(f));
-  const sub = ui.cart.reduce((s, l) => s + l.qty * l.rate, 0);
-  const vat = ui.cart.reduce((s, l) => s + (l.taxable !== false ? l.qty * l.rate * db.company.vatRate / 100 : 0), 0);
-  const total = r2(sub + vat);
+  const taxes = salesTaxes(ui.cart);
+  const {total} = taxes;
   return `
   <div class="pos-wrap">
     <div class="card">
@@ -864,9 +901,7 @@ function viewPOS() {
           </div>`).join('') : `<div class="empty" style="padding:26px">Cart is empty</div>`}
         </div>
         <div class="totals">
-          <div class="tr"><span>Subtotal</span><strong>${money(sub)}</strong></div>
-          <div class="tr"><span>VAT @ ${db.company.vatRate}%</span><strong>${money(vat)}</strong></div>
-          <div class="tr big"><span>TOTAL</span><span>${money(total)}</span></div>
+          ${invoiceTaxRows(taxes, 'style="display:flex;justify-content:space-between;padding:5px 0"')}
         </div>
         <button class="btn ok" style="width:100%;margin-top:14px;padding:12px" ${ui.cart.length ? '' : 'disabled style="width:100%;margin-top:14px;padding:12px;opacity:.4"'} onclick="posCheckout()">Charge ${money(total)}</button>
       </div>
@@ -878,7 +913,7 @@ function posAdd(id) {
   if (item.type === 'Inventory' && item.qty <= 0) return toast('Out of stock', 'bad');
   const existing = ui.cart.find(l => l.itemId === id);
   if (existing) existing.qty++;
-  else ui.cart.push({ itemId: item.id, name: item.name, qty: 1, rate: item.price, taxable: item.taxable, revAcct: item.revAcct, cogsAcct: item.cogsAcct, cost: item.cost });
+  else ui.cart.push({ itemId: item.id, name: item.name, qty: 1, rate: item.price, taxable: item.taxable, hslEligible: item.hslEligible === true, revAcct: item.revAcct, cogsAcct: item.cogsAcct, cost: item.cost });
   render();
 }
 function posQty(idx, delta) { const l = ui.cart[idx]; if (!l) return; l.qty += delta; if (l.qty <= 0) ui.cart.splice(idx, 1); render(); }
@@ -891,11 +926,7 @@ function posCheckout() {
     <div class="field"><label class="fl">Payment Method</label><select class="inp" id="posMethod"><option value="1000">Cash</option><option value="1010">Card / Bank Transfer</option></select></div>
   `, `<button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn ok" onclick="posFinalize('${customerId}')">Complete Sale</button>`, 'slim');
 }
-function cartTotal() {
-  const sub = ui.cart.reduce((sum, l) => sum + r2(l.qty * l.rate), 0);
-  const taxable = ui.cart.reduce((sum, l) => sum + (l.taxable !== false ? r2(l.qty * l.rate) : 0), 0);
-  return r2(sub + r2(taxable * db.company.vatRate / 100));
-}
+function cartTotal() { return salesTaxes(ui.cart).total; }
 function posFinalize(customerId) {
   requireValue(nval('posTender') >= cartTotal(), 'Amount tendered is below the sale total.');
   const change = r2(nval('posTender') - cartTotal());
@@ -958,10 +989,7 @@ function newInvoiceModal() {
     <tbody id="invLines"></tbody></table>
     <button class="btn-sm" style="margin-top:10px" onclick="addInvLineRow()">+ Add Line</button>
     <div style="margin-top:16px;margin-left:auto;max-width:300px">
-      <div style="display:flex;justify-content:space-between;padding:5px 0"><span>Subtotal</span><strong id="invSub">EC$0.00</strong></div>
-      <div style="display:flex;justify-content:space-between;padding:5px 0"><span>VAT @ ${db.company.vatRate}%</span><strong id="invVat">EC$0.00</strong></div>
-      <div style="display:flex;justify-content:space-between;padding:9px 0;border-top:2px solid #e2e8f0;margin-top:6px;font-size:16px;font-weight:800"><span>Total</span><span id="invTotal">EC$0.00</span></div>
-    </div>
+      ${invoiceTaxRows(salesTaxes([]), 'style="display:flex;justify-content:space-between;padding:5px 0"', true)}</div>
   `, `<button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveInvoice()">Save & Post Invoice</button>`, 'wide');
   addInvLineRow(); addInvLineRow();
 }
@@ -969,7 +997,9 @@ function itemOptionsHTML(sel) { return `<option value="">— free text —</opti
 function addInvLineRow() {
   const tb = document.getElementById('invLines'); const tr = document.createElement('tr');
   tr.innerHTML = `<td><select class="inp line-item" onchange="lineItemChange(this)">${itemOptionsHTML()}</select>
-      <input class="inp line-desc" placeholder="Description" style="margin-top:5px;font-size:12px"></td>
+      <input class="inp line-desc" placeholder="Description" style="margin-top:5px;font-size:12px">
+      <label><input type="checkbox" class="line-vat" checked onchange="recalcInvoice()"> VAT taxable</label>
+      <label><input type="checkbox" class="line-hsl" onchange="recalcInvoice()"> HSL eligible</label></td>
     <td><input class="inp line-qty" type="number" min="0" step="0.01" value="1" oninput="recalcInvoice()"></td>
     <td><input class="inp line-rate" type="number" min="0" step="0.01" value="0" oninput="recalcInvoice()"></td>
     <td class="num line-amt" style="font-weight:600">EC$0.00</td>
@@ -977,23 +1007,24 @@ function addInvLineRow() {
   tb.appendChild(tr);
 }
 function lineItemChange(sel) {
-  const tr = sel.closest('tr'); const item = db.items.find(i => i.id === sel.value); if (!item) return;
+  const tr = sel.closest('tr'); const item = db.items.find(i => i.id === sel.value);
+  tr.querySelector('.line-hsl').checked = item?.hslEligible === true;
+  tr.querySelector('.line-vat').checked = item?.taxable !== false;
+  if (!item) { recalcInvoice(); return; }
   tr.querySelector('.line-desc').value = item.name;
   tr.querySelector('.line-rate').value = item.price || item.dayRate || 0;
   recalcInvoice();
 }
 function recalcInvoice() {
-  let sub = 0, vat = 0;
-  document.querySelectorAll('#invLines tr').forEach(tr => {
-    const qty = num(tr.querySelector('.line-qty').value); const rate = num(tr.querySelector('.line-rate').value);
-    const amt = r2(qty * rate); tr.querySelector('.line-amt').textContent = money(amt);
-    const itemId = tr.querySelector('.line-item').value; const item = db.items.find(i => i.id === itemId);
-    const taxable = item ? item.taxable !== false : true;
-    sub += amt; if (taxable) vat += amt * db.company.vatRate / 100;
+  const lines = Array.from(document.querySelectorAll('#invLines tr'), tr => {
+    const qty = num(tr.querySelector('.line-qty').value);
+    const rate = num(tr.querySelector('.line-rate').value);
+    tr.querySelector('.line-amt').textContent = money(r2(qty * rate));
+    return {qty,rate,taxable:tr.querySelector('.line-vat').checked,hslEligible:tr.querySelector('.line-hsl').checked};
   });
-  document.getElementById('invSub').textContent = money(sub);
-  document.getElementById('invVat').textContent = money(vat);
-  document.getElementById('invTotal').textContent = money(sub + vat);
+  const totals = salesTaxes(lines);
+  for (const [id,key] of Object.entries({invSub:'subtotal',invHsl:'hsl',invVatBase:'vatBase',invVat:'vat',invTotal:'total'}))
+    document.getElementById(id).textContent = money(totals[key]);
 }
 function saveInvoice() {
   const lines = [];
@@ -1003,7 +1034,7 @@ function saveInvoice() {
     const qty = num(tr.querySelector('.line-qty').value); const rate = num(tr.querySelector('.line-rate').value);
     if (!desc || qty <= 0) return;
     const item = db.items.find(i => i.id === itemId);
-    lines.push({ itemId, desc, qty, rate, taxable: item ? item.taxable !== false : true, revAcct: item ? item.revAcct : '4010', cogsAcct: item ? item.cogsAcct : '5000', cost: item ? item.cost : 0 });
+    lines.push({ itemId, desc, qty, rate, taxable: tr.querySelector('.line-vat').checked, hslEligible: tr.querySelector('.line-hsl').checked, revAcct: item ? item.revAcct : '4010', cogsAcct: item ? item.cogsAcct : '5000', cost: item ? item.cost : 0 });
   });
   if (!lines.length) return toast('Add at least one line', 'bad');
   const inv = createInvoice({ customerId: val('invCustomer'), date: val('invDate'), dueDate: val('invDue'), projectId: val('invProject'), lines, source: 'AR' });
@@ -1034,8 +1065,7 @@ function showInvoice(id) {
     <table><thead><tr><th>Description</th><th class="num">Qty</th><th class="num">Rate</th><th class="num">Amount</th></tr></thead>
     <tbody>${inv.lines.map(l => `<tr><td>${esc(l.desc)}</td><td class="num">${l.qty}</td><td class="num">${money(l.rate)}</td><td class="num">${money(l.amount)}</td></tr>`).join('')}</tbody></table>
     <div style="margin-left:auto;max-width:300px;margin-top:14px">
-      <div style="display:flex;justify-content:space-between;padding:5px 0"><span>Subtotal</span><strong>${money(inv.subtotal)}</strong></div>
-      <div style="display:flex;justify-content:space-between;padding:5px 0"><span>VAT</span><strong>${money(inv.vat)}</strong></div>
+      ${invoiceTaxRows(inv,'style="display:flex;justify-content:space-between;padding:5px 0"')}
       <div style="display:flex;justify-content:space-between;padding:5px 0"><span>Paid</span><strong>${money(inv.paid)}</strong></div>
       <div style="display:flex;justify-content:space-between;padding:9px 0;border-top:2px solid #e2e8f0;margin-top:6px;font-size:16px;font-weight:800"><span>Balance Due</span><span>${money(invoiceDue(inv))}</span></div>
     </div>
@@ -1062,8 +1092,7 @@ function printInvoice(id) {
     <strong>BILL TO</strong><br>${esc(c.name || '')}<br><span style="color:#64748b">${esc(c.addr || '')}<br>${esc(c.phone || '')}</span>
     <table><thead><tr><th>Description</th><th class="num">Qty</th><th class="num">Rate</th><th class="num">Amount</th></tr></thead>
     <tbody>${inv.lines.map(l => `<tr><td>${esc(l.desc)}</td><td class="num">${l.qty}</td><td class="num">${money(l.rate)}</td><td class="num">${money(l.amount)}</td></tr>`).join('')}</tbody></table>
-    <div class="tot"><div><span>Subtotal</span><strong>${money(inv.subtotal)}</strong></div>
-      <div><span>VAT</span><strong>${money(inv.vat)}</strong></div>
+    <div class="tot">${invoiceTaxRows(inv)}
       <div><span>Paid</span><strong>${money(inv.paid)}</strong></div>
       <div class="big"><span>Balance Due</span><span>${money(invoiceDue(inv))}</span></div></div>
   </body></html>`);
@@ -1258,12 +1287,13 @@ function editItemModal(id) {
     <div class="row"><div class="field"><label class="fl">Revenue Account</label><select class="inp" id="itRev">${(db.accounts||[]).filter(a => a.type === 'Revenue').map(a => `<option value="${a.code}" ${i.revAcct === a.code ? 'selected' : ''}>${a.code} · ${esc(a.name)}</option>`).join('')}</select></div>
       <div class="field"><label class="fl">COGS Account</label><select class="inp" id="itCogs">${(db.accounts||[]).filter(a => a.type === 'Expense').map(a => `<option value="${a.code}" ${i.cogsAcct === a.code ? 'selected' : ''}>${a.code} · ${esc(a.name)}</option>`).join('')}</select></div>
       <div class="field"><label class="fl">Taxable</label><select class="inp" id="itTax"><option value="1" ${i.taxable ? 'selected' : ''}>Yes</option><option value="0" ${!i.taxable ? 'selected' : ''}>No</option></select></div></div>
+    <p><label><input type="checkbox" id="itHsl" ${i.hslEligible===true?'checked':''}> Eligible for HSL on sales or rental invoices</label></p>
   `, `<button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveItem(${id ? `'${id}'` : 'null'})">Save Item</button>`, 'wide');
 }
 function toggleRentalFields() { document.getElementById('rentalFields').style.display = document.getElementById('itType').value === 'Rental' ? 'block' : 'none'; }
 function saveItem(id) {
   const type = val('itType');
-  const data = { sku: val('itSku'), name: val('itName'), category: val('itCat'), type, unit: val('itUnit'), cost: nval('itCost'), price: nval('itPrice'), qty: nval('itQty'), reorder: nval('itReorder'), taxable: val('itTax') === '1', revAcct: val('itRev'), cogsAcct: val('itCogs'), dayRate: nval('itDay'), weekRate: nval('itWeek'), monthRate: nval('itMonth'), deposit: nval('itDep') };
+  const data = { sku: val('itSku'), name: val('itName'), category: val('itCat'), type, unit: val('itUnit'), cost: nval('itCost'), price: nval('itPrice'), qty: nval('itQty'), reorder: nval('itReorder'), taxable: val('itTax') === '1', hslEligible: document.getElementById('itHsl').checked, revAcct: val('itRev'), cogsAcct: val('itCogs'), dayRate: nval('itDay'), weekRate: nval('itWeek'), monthRate: nval('itMonth'), deposit: nval('itDep') };
   requireValue(data.name && data.sku, 'Enter an item name and SKU.');
   requireValue(!db.items.some(i => i.id !== id && i.sku.toLowerCase() === data.sku.toLowerCase()), 'SKU already exists.');
   requireValue(['cost','price','qty','reorder','dayRate','weekRate','monthRate','deposit'].every(k =>
@@ -1722,17 +1752,19 @@ function salesReport() {
 }
 function vatReport() {
   const month = (ui.vatMonth || today().slice(0, 7));
-  let output = 0, input = 0;
+  let output = 0, input = 0, hsl = 0;
   (db.gl || []).filter(e => e.date.slice(0, 7) === month && ['Sales', 'Purchase'].includes(e.source)).forEach(e => {
+    if (e.source === 'Sales') for (const l of e.lines) if (l.code === HSL_ACCOUNT) hsl += l.credit - l.debit;
     e.lines.filter(l => l.code === '2100').forEach(l => { output += l.credit; input += l.debit; });
   });
   const net = r2(output - input);
-  return `<div class="card"><div class="card-h"><h3>Monthly VAT Ledger Worksheet</h3>
+  return `<div class="card"><div class="card-h"><h3>Monthly VAT &amp; HSL Ledger Worksheet</h3>
       <input class="inp" type="month" value="${month}" style="width:auto" onchange="ui.vatMonth=this.value;render()"></div>
     <div class="card-b"><div class="stmnt" style="max-width:520px">
       <div class="li"><span>VAT on sales (output)</span><span>${money(output)}</span></div>
       <div class="li"><span>VAT on purchases (input)</span><span>${money(input)}</span></div>
       <div class="li total"><span>${net >= 0 ? 'NET OUTPUT VAT' : 'NET INPUT VAT'}</span><span>${money(Math.abs(net))}</span></div></div>
+      <div class="stmnt" style="max-width:520px"><div class="li"><span>HSL charged on sales (account 2115)</span><span>${money(hsl)}</span></div></div>
       <p class="muted" style="font-size:12px;margin-top:18px">VAT Reg: <strong>${esc(db.company.vatNo)}</strong> · TIN <strong>${esc(db.company.tin)}</strong> · Worksheet for review before filing.</p>
     </div></div>`;
 }
@@ -1776,6 +1808,11 @@ function viewSettings() {
       <div class="row"><div class="field"><label class="fl">Default Terms</label>
         <select class="inp" id="coTerms">${['Due on receipt', 'Net 15', 'Net 30', 'Net 45', 'Net 60'].map(t => `<option ${c.terms === t ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
         <div class="field"><label class="fl">Rental Late Fee (%/day)</label><input class="inp" id="coLate" type="number" step="1" value="${c.lateFeePct}"></div></div>
+      <div class="sec-title">Health &amp; Security Levy (HSL)</div>
+      <p><label><input id="coHslEnabled" type="checkbox" ${c.hslEnabled===true?'checked':''}> Charge HSL on eligible sales lines</label></p>
+      <div class="field"><label for="coHslRate">HSL rate (%)</label><input class="inp" id="coHslRate" type="number" min="0" max="100" step="0.01" value="${esc(c.hslRate ?? 2.5)}"></div>
+      <p><label><input id="coHslVat" type="checkbox" ${c.hslInVat!==false?'checked':''}> Include HSL in the VAT base</label></p>
+      <p class="muted">Mark eligible items and services in Inventory or tick HSL eligible on a sales invoice line. In Saint Lucia, goods generally incur the levy at import. Confirm which services qualify before charging it.</p>
       <button class="btn" onclick="saveCompany()">Save Company Settings</button>
     </div></div>
 
@@ -1828,6 +1865,12 @@ function viewSettings() {
   </div>`;
 }
 function saveCompany() {
+  const hslRate = nvalFrom(document.getElementById('coHslRate'));
+  requireValue(Number.isFinite(hslRate) && hslRate >= 0 && hslRate <= 100 && r2(hslRate) === hslRate,
+    'Enter an HSL rate between 0 and 100 with up to two decimal places.');
+  const hslEnabled = document.getElementById('coHslEnabled').checked;
+  if (hslEnabled) ensureHslAccount();
+  Object.assign(db.company,{hslRate,hslEnabled,hslInVat:document.getElementById('coHslVat').checked});
   requireValue(val('coName2') && nval('coRate') >= 0 && nval('coRate') <= 100 &&
     nval('coLate') >= 0 && nval('coLate') <= 100, 'Enter a company name and percentage rates from 0 to 100.');
   Object.assign(db.company, { name: val('coName2'), addr: val('coAddr'), phone: val('coPhone'), email: val('coEmail'), tin: val('coTin'), vatNo: val('coVat'), vatRate: nval('coRate'), terms: val('coTerms'), lateFeePct: nval('coLate') });
@@ -2638,7 +2681,7 @@ function saveMaterialsIssue(id) {
 
 /* Spreadsheet intake. All processing stays in this browser. */
 const IMPORT_TYPES = {
-  items: ['Inventory, tools & equipment','sku,name,type,category,unit,quantity,cost,price,reorder,taxable,daily_rate,weekly_rate,monthly_rate,deposit,revenue_account,cogs_account',
+  items: ['Inventory, tools & equipment','sku,name,type,category,unit,quantity,cost,price,reorder,taxable,daily_rate,weekly_rate,monthly_rate,deposit,revenue_account,cogs_account,hsl_eligible',
     'RNT-DRILL,Rotary drill,Rental,Tools,unit,2,600,0,0,yes,50,220,700,150,4020,6200',
     'CEM-50,Portland cement,Inventory,Materials,bag,100,22.50,32,20,yes,,,,,4010,5000'],
   customers: ['Customers','id,name,contact,phone,email,address,terms','CUST-IMPORT-01,Example Construction,Accounts,7585550100,accounts@example.com,Castries,Net 30'],
@@ -2875,7 +2918,9 @@ function buildImport(kind, sheet, options) {
         requireValue(type!=='Service' || qty===0,'Services must have zero stock.');
         const tax=(v.taxable||'yes').toLowerCase();
         requireValue(['yes','no','true','false','1','0'].includes(tax),'Taxable must be Yes or No.');
-        const item={sku:v.sku,name:v.name,type,qty,cost,onRent:0,category:v.category||'',unit:v.unit||'unit',
+        const levy = (v.hsl_eligible || 'no').toLowerCase();
+        requireValue(['yes','no','true','false','1','0'].includes(levy),'HSL eligible must be Yes or No.');
+        const item={hslEligible:['yes','true','1'].includes(levy),sku:v.sku,name:v.name,type,qty,cost,onRent:0,category:v.category||'',unit:v.unit||'unit',
           price:importMoney(v.price,'price'),reorder:importMoney(v.reorder,'reorder quantity'),
           taxable:['yes','true','1'].includes(tax), dayRate:importMoney(v.daily_rate,'daily rate'),
           weekRate:importMoney(v.weekly_rate,'weekly rate'),monthRate:importMoney(v.monthly_rate,'monthly rate'),
@@ -2896,7 +2941,7 @@ function buildImport(kind, sheet, options) {
         unique(code,db.accounts.map(a=>a.code));
         const type=['Asset','Liability','Equity','Revenue','Expense'].find(t=>t.toLowerCase()===v.type.toLowerCase());
         requireValue(type && v.name,'Enter an account name and a valid account type.');
-        requireValue(code!=='3090','Account 3090 is reserved for opening stock clearing.');
+        requireValue(code!=='3090' && (code!==HSL_ACCOUNT || (type==='Liability' && v.name==='Health & Security Levy Payable')),'Account '+code+' is reserved by IslandBuild.');
         rows.push({code,name:v.name,type});
       } else if (isOpening) {
         const code=importAccount(v.account_code);
