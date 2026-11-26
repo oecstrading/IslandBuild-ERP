@@ -454,6 +454,9 @@ function ensureHslAccount() {
     'Account 2115 is reserved for Health & Security Levy Payable.');
 }
 function invoiceTaxRows(inv, attrs = '', withIds = false) {
+  if (inv.source==='Retention Release')
+    return `<div ${attrs}><span>Retention now payable</span><strong>${money(inv.total)}</strong></div>
+      <p>Retention was withheld on previously billed work. No additional VAT or HSL is charged on this release.</p>`;
   const fields = [
     ['Subtotal', 'subtotal', 'invSub'],
     [inv.hslRate ? 'HSL @ '+inv.hslRate+'%' : 'HSL', 'hsl', 'invHsl'],
@@ -478,15 +481,28 @@ function createInvoice(opt) {
   }
   const project = (db.projects || []).find(p => p.id === opt.projectId);
   requireValue(!project || project.customerId === opt.customerId, 'Choose the customer assigned to this project.');
+  const certified = ['Construction Progress','Construction Final'].includes(opt.source);
+  requireValue(!project?.contract || certified, 'Post certified work from the project’s Contract lifecycle panel.');
   const vatRate = opt.vatRate !== undefined ? opt.vatRate : db.company.vatRate;
   const inv = { id: nextNo('INV-', 'inv'), customerId: opt.customerId, date: opt.date || today(),
     dueDate: opt.dueDate || opt.date || today(), lines: opt.lines.map(l => ({ ...l })),
     subtotal: 0, vat: 0, total: 0, paid: 0, status: 'Open', source: opt.source || 'AR',
-    projectId: opt.projectId || '', notes: opt.notes || '', rentalId: opt.rentalId || null };
+    projectId: opt.projectId || '', certificateRef: opt.certificateRef, notes: opt.notes || '', rentalId: opt.rentalId || null };
   inv.lines.forEach(l => { l.amount = r2(l.qty * l.rate); });
   Object.assign(inv, salesTaxes(inv.lines, vatRate));
   const debitAcct = opt.paidNow ? (opt.payAccount || '1000') : '1100';
-  const glLines = [{ code: debitAcct, debit: inv.total }];
+  const retention = opt.retentionHeld ?? 0;
+  requireValue(Number.isFinite(retention) && retention>=0 && retention<=inv.subtotal && (!retention || certified && !opt.paidNow),
+    'Invalid construction retention amount.');
+  inv.retentionHeld = retention;
+  const glLines = [{code:debitAcct,debit:r2(inv.total-retention)}];
+  if (retention) {
+    if (!account(RETENTION_ACCOUNT)) db.accounts.push({code:RETENTION_ACCOUNT,name:'Construction Retention Receivable',type:'Asset'});
+    const control = account(RETENTION_ACCOUNT);
+    requireValue(control.type==='Asset' && control.name==='Construction Retention Receivable',
+      'Account 1110 must be Construction Retention Receivable (Asset).');
+    glLines.push({code:RETENTION_ACCOUNT,debit:retention});
+  }
   const revTotals = {};
   inv.lines.forEach(l => { const acct = l.revAcct || '4010'; revTotals[acct] = (revTotals[acct] || 0) + l.amount; });
   Object.entries(revTotals).forEach(([acct, amt]) => glLines.push({ code: acct, credit: r2(amt) }));
@@ -510,7 +526,8 @@ function createInvoice(opt) {
         [{ code: item.cogsAcct || '5000', debit: cost }, { code: '1200', credit: cost }]);
     }
   });
-  if (opt.paidNow || !inv.total) { inv.paid = inv.total; inv.status = 'Paid'; }
+  if (opt.paidNow) inv.paid = inv.total;
+  if (!invoiceDue(inv)) inv.status = retention ? 'Retention withheld' : 'Paid';
   if (opt.paidNow && inv.total > 0) db.payments.push({
     id: nextNo('RCP-', 'pay'), type: 'received', partyId: inv.customerId, date: inv.date,
     amount: inv.total, method: debitAcct === '1000' ? 'Cash' : 'Card / Bank Transfer', account: debitAcct, ref: inv.id
@@ -521,12 +538,12 @@ function createInvoice(opt) {
 function payInvoice(id, amount, date, account, method) {
   const inv = db.invoices.find(i => i.id === id); if (!inv) return;
   requireValue(validDate(date) && date >= inv.date, 'Payment date must be on or after the document date.');
-  requireValue(amount > 0 && amount <= r2(inv.total - inv.paid), 'Enter a positive payment up to the outstanding balance.');
+  requireValue(amount > 0 && amount <= invoiceDue(inv), 'Enter a positive payment up to the outstanding balance.');
   amount = r2(amount);
   if (amount <= 0) return toast('Nothing left to pay on this invoice', 'bad');
   account = account || '1010';
   inv.paid = r2(inv.paid + amount);
-  inv.status = inv.paid >= inv.total - 0.005 ? 'Paid' : 'Partial';
+  inv.status = invoiceDue(inv) ? 'Partial' : inv.retentionHeld ? 'Retention withheld' : 'Paid';
   post(date || today(), `Payment received — ${inv.id}`, inv.id, 'Receipt',
     [{ code: account, debit: amount }, { code: '1100', credit: amount }]);
   if(!db.payments) db.payments = [];
@@ -536,6 +553,7 @@ function payInvoice(id, amount, date, account, method) {
 }
 function createBill(opt) {
   checkDocument(opt, db.vendors, opt.vendorId);
+  requireValue(!job(opt.projectId)?.closed,'This project is closed.');
   for (const line of opt.lines) {
     const item = db.items.find(i => i.id === line.itemId);
     requireValue(line.itemId ? item?.type === 'Inventory' && line.acct === '1200' : line.acct !== '1200',
@@ -663,7 +681,7 @@ function returnRental(id, opt) {
 const customerName = id => (db.customers.find(c => c.id === id) || {}).name || '—';
 const vendorName = id => (db.vendors.find(v => v.id === id) || {}).name || '—';
 const itemName = id => (db.items.find(i => i.id === id) || {}).name || '—';
-function invoiceDue(inv) { return r2(inv.total - inv.paid); }
+function invoiceDue(inv) { return r2(inv.total - inv.paid - (inv.retentionHeld || 0)); }
 function billDue(b) { return r2(b.total - b.paid); }
 function rentalOverdue(r) { return r.status === 'Out' && r.dueDate < today(); }
 
@@ -1049,7 +1067,12 @@ function payInvoiceModal(id) {
     <div class="field"><label class="fl">Deposit To</label><select class="inp" id="payAcct"><option value="1010">Bank — Republic Bank</option><option value="1000">Cash on Hand</option></select></div>
   `, `<button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn ok" onclick="doPayInvoice('${id}')">Record Payment</button>`, 'slim');
 }
-function doPayInvoice(id) { payInvoice(id, nval('payAmt'), val('payDate'), val('payAcct')); closeModal(); render(); }
+function doPayInvoice(id) {
+  const projectId = db.invoices.find(i=>i.id===id)?.projectId;
+  payInvoice(id,nval('payAmt'),val('payDate'),val('payAcct'));
+  closeModal(); render();
+  if (route==='projects' && job(projectId)) showProject(projectId);
+}
 function showInvoice(id) {
   const inv = db.invoices.find(i => i.id === id); if (!inv) return;
   const c = db.customers.find(x => x.id === inv.customerId) || {};
@@ -1057,7 +1080,7 @@ function showInvoice(id) {
     <div style="display:flex;justify-content:space-between;margin-bottom:18px">
       <div><div style="font-size:16px;font-weight:800">${esc(db.company.name)}</div>
         <div class="muted" style="font-size:12px">${esc(db.company.addr)}<br>${esc(db.company.phone)} · TIN ${esc(db.company.tin)}</div></div>
-      <div style="text-align:right"><div style="font-size:20px;font-weight:800;color:#0284c7">INVOICE</div>
+      <div style="text-align:right"><div style="font-size:20px;font-weight:800;color:#0284c7">${inv.source==='Retention Release'?'RETENTION RELEASE':'INVOICE'}</div>
         <div class="muted" style="font-size:12px">${inv.id}<br>Date: ${inv.date}<br>Due: ${inv.dueDate}</div></div>
     </div>
     <div class="sec-title">Bill To</div>
@@ -1066,6 +1089,7 @@ function showInvoice(id) {
     <tbody>${inv.lines.map(l => `<tr><td>${esc(l.desc)}</td><td class="num">${l.qty}</td><td class="num">${money(l.rate)}</td><td class="num">${money(l.amount)}</td></tr>`).join('')}</tbody></table>
     <div style="margin-left:auto;max-width:300px;margin-top:14px">
       ${invoiceTaxRows(inv,'style="display:flex;justify-content:space-between;padding:5px 0"')}
+      ${inv.retentionHeld ? `<div style="display:flex;justify-content:space-between"><span>Less retention withheld</span><strong>${money(inv.retentionHeld)}</strong></div>` : ''}
       <div style="display:flex;justify-content:space-between;padding:5px 0"><span>Paid</span><strong>${money(inv.paid)}</strong></div>
       <div style="display:flex;justify-content:space-between;padding:9px 0;border-top:2px solid #e2e8f0;margin-top:6px;font-size:16px;font-weight:800"><span>Balance Due</span><span>${money(invoiceDue(inv))}</span></div>
     </div>
@@ -1086,13 +1110,14 @@ function printInvoice(id) {
   </style></head><body>
     <div class="hdr"><div><h2 style="margin:0">${esc(db.company.name)}</h2>
       <div style="color:#64748b;font-size:12px">${esc(db.company.addr)}<br>${esc(db.company.phone)} · TIN ${esc(db.company.tin)}<br>VAT ${esc(db.company.vatNo)}</div></div>
-      <div style="text-align:right"><h2 style="margin:0;color:#0284c7">INVOICE</h2>
+      <div style="text-align:right"><h2 style="margin:0;color:#0284c7">${inv.source==='Retention Release'?'RETENTION RELEASE':'INVOICE'}</h2>
       <div style="font-size:12px">${inv.id}<br>Date ${inv.date}<br>Due ${inv.dueDate}</div></div></div>
     <hr style="margin:20px 0;border:0;border-top:1px solid #e2e8f0">
     <strong>BILL TO</strong><br>${esc(c.name || '')}<br><span style="color:#64748b">${esc(c.addr || '')}<br>${esc(c.phone || '')}</span>
     <table><thead><tr><th>Description</th><th class="num">Qty</th><th class="num">Rate</th><th class="num">Amount</th></tr></thead>
     <tbody>${inv.lines.map(l => `<tr><td>${esc(l.desc)}</td><td class="num">${l.qty}</td><td class="num">${money(l.rate)}</td><td class="num">${money(l.amount)}</td></tr>`).join('')}</tbody></table>
     <div class="tot">${invoiceTaxRows(inv)}
+      ${inv.retentionHeld ? `<div><span>Less retention withheld</span><strong>${money(inv.retentionHeld)}</strong></div>` : ''}
       <div><span>Paid</span><strong>${money(inv.paid)}</strong></div>
       <div class="big"><span>Balance Due</span><span>${money(invoiceDue(inv))}</span></div></div>
   </body></html>`);
@@ -1740,15 +1765,18 @@ function agingReport(kind) {
 function salesReport() {
   const byCust = {};
   (db.invoices||[]).forEach(i => {
-    byCust[i.customerId] = byCust[i.customerId] || { count: 0, total: 0, paid: 0 };
-    byCust[i.customerId].count++; byCust[i.customerId].total += i.total; byCust[i.customerId].paid += i.paid;
+    byCust[i.customerId] = byCust[i.customerId] || { count: 0, total: 0, paid: 0, due: 0 };
+    const customer = byCust[i.customerId];
+    if (i.source!=='Retention Release') { customer.count++; customer.total += i.total; }
+    customer.paid += i.paid;
+    customer.due += invoiceDue(i);
   });
   return `<div class="card"><div class="card-h"><h3>Sales by Customer</h3></div>
     <div class="card-b" style="padding:0"><table>
       <thead><tr><th>Customer</th><th class="num">Invoices</th><th class="num">Invoiced</th><th class="num">Collected</th><th class="num">Outstanding</th></tr></thead>
       <tbody>${Object.entries(byCust).map(([id, v]) => `<tr><td><strong>${esc(customerName(id))}</strong></td>
         <td class="num">${v.count}</td><td class="num">${money(v.total)}</td><td class="num">${money(v.paid)}</td>
-        <td class="num" style="font-weight:700">${money(v.total - v.paid)}</td></tr>`).join('')}</tbody></table></div></div>`;
+        <td class="num" style="font-weight:700">${money(v.due)}</td></tr>`).join('')}</tbody></table></div></div>`;
 }
 function vatReport() {
   const month = (ui.vatMonth || today().slice(0, 7));
@@ -2055,6 +2083,14 @@ const aiExec = {
 };
 
 function aiLocal(prompt) {
+  if (/retention|contract status|construction closeout/i.test(prompt)) {
+    const projects=(db.projects||[]).filter(p=>p.contract);
+    return projects.length ? projects.map(p=>{
+      const f=jobCommercial(p);
+      return p.name+' · '+f.phase+' · '+money(f.remaining)+' unbilled · '+money(f.ordinaryDue)+' invoice balance · '+
+        money(f.held)+' retention held · '+money(f.releaseDue)+' released retention due';
+    }).join('\n') : 'No signed construction contracts are recorded.';
+  }
   const p = prompt.toLowerCase().trim();
 
   if (/^(hi|hello|hey|good (morning|afternoon|evening))/.test(p) || /what can you do|help/.test(p)) {
@@ -2463,14 +2499,14 @@ function viewProjects() {
     <div><button class="btn-sm" onclick="exportProjects()">Export CSV</button>
     <button class="btn" onclick="projectModal()">+ Project</button></div></div>
     <div style="overflow:auto"><table><thead><tr><th>Project</th><th>Customer</th><th>Status</th><th>Due</th>
-      <th>Tasks done</th><th>Cost budget</th><th>Actual cost</th><th>Billed ex VAT</th><th>Margin</th></tr></thead>
+      <th>Tasks done</th><th>Cost budget</th><th>Actual cost</th><th>Billed ex tax</th><th>Retention held</th><th>Margin</th></tr></thead>
     <tbody>${projects.map(p => {
       const f = projectFigures(p.id);
       return `<tr><td><button class="btn-sm" onclick="showProject('${p.id}')">${esc(p.name)}</button></td>
-        <td>${esc(customerName(p.customerId))}</td><td>${esc(p.status)}</td><td>${esc(p.due)}</td>
+        <td>${esc(customerName(p.customerId))}</td><td>${esc(jobCommercial(p).phase)}</td><td>${esc(p.due)}</td>
         <td>${p.tasks.filter(t => t.status === 'Done').length}/${p.tasks.length}</td>
-        <td>${money(p.budget)}</td><td>${money(f.costs)}</td><td>${money(f.billed)}</td><td>${money(f.margin)}</td></tr>`;
-    }).join('') || '<tr><td colspan="9" class="empty">Create a project to schedule work and track job costs.</td></tr>'}
+        <td>${money(p.budget)}</td><td>${money(f.costs)}</td><td>${money(f.billed)}</td><td>${money(jobCommercial(p).held)}</td><td>${money(f.margin)}</td></tr>`;
+    }).join('') || '<tr><td colspan="10" class="empty">Create a project to schedule work and track job costs.</td></tr>'}
     </tbody></table></div>
     <p class="card-b muted">Actual cost includes expense lines on linked bills, inventory cost on linked sales, materials issued to the job and allocated payroll. Capital purchases and materials still in stock stay on the balance sheet.</p></div>`;
 }
@@ -2497,6 +2533,8 @@ function saveProject(id) {
     db.projects ||= [];
     const project = db.projects.find(p => p.id === id);
     if (project) {
+      requireValue(!project.closed && !project.signoff,'Project details are locked after sign-off.');
+      requireValue(!project.contract || data.status!=='Complete','Use completion sign-off in the Contract lifecycle panel.');
       requireValue(project.tasks.every(t => t.due >= data.start && t.due <= data.due),
         'The project dates must include all scheduled tasks.');
       requireValue(data.status !== 'Complete' || project.tasks.every(t => t.status === 'Done'), 'Complete the remaining tasks first.');
@@ -2520,7 +2558,8 @@ function showProject(id) {
     <table><tbody><tr><th>Cost budget</th><td>${money(p.budget)}</td><th>Actual cost</th><td>${money(f.costs)}</td></tr>
       <tr><th>Budget remaining</th><td>${money(p.budget - f.costs)}</td><th>Margin on posted work</th><td>${money(f.margin)}</td></tr>
       <tr><th>Allocated payroll included in cost</th><td colspan="3">${money(f.payrollCost)}</td></tr>
-      <tr><th>Billed ex VAT</th><td>${money(f.billed)}</td><th>Receivable incl. VAT</th><td>${money(f.due)}</td></tr></tbody></table>
+      <tr><th>Billed ex tax</th><td>${money(f.billed)}</td><th>Trade balance due</th><td>${money(f.due)}</td></tr></tbody></table>
+    ${constructionPanel(p)}
     <div class="sec-title">Work schedule</div>
     <table><thead><tr><th>Task</th><th>Assigned to</th><th>Due</th><th>Status</th><th></th></tr></thead>
     <tbody>${tasks.map(t => `<tr><td>${esc(t.name)}</td><td>${esc(t.owner)}</td><td>${esc(t.due)}
@@ -2552,6 +2591,7 @@ function taskModal(projectId, taskId) {
 }
 function saveTask(projectId, taskId) {
   const p = db.projects.find(item => item.id === projectId);
+  requireValue(!p.signoff && !p.closed,'The work schedule is locked after completion sign-off.');
   const data = { name: val('taskName'), owner: val('taskOwner'), due: val('taskDue'), status: val('taskStatus') };
   requireValue(data.name && validDate(data.due) && data.due >= p.start && data.due <= p.due,
     'Enter a task name and due date within the project schedule.');
@@ -2573,10 +2613,12 @@ function downloadFile(name, contents, type) {
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 function exportProjects() {
-  const rows = [['Project','Customer','Status','Start','Due','Budget XCD','Actual cost XCD','Billed ex VAT XCD','Margin XCD','Receivable XCD']];
+  const rows = [['Project','Customer','Status','Start','Due','Budget XCD','Actual cost XCD','Billed ex tax XCD','Margin XCD','Receivable XCD','Contract reference','Revised contract XCD','Retention held XCD','Released retention due XCD','Cash received XCD']];
   for (const p of db.projects || []) {
     const f = projectFigures(p.id);
-    rows.push([p.name, customerName(p.customerId), p.status, p.start, p.due, p.budget, f.costs, f.billed, f.margin, f.due]);
+    const c = jobCommercial(p);
+    rows.push([p.name,customerName(p.customerId),c.phase,p.start,p.due,p.budget,f.costs,f.billed,f.margin,f.due,
+      p.contract?.ref||'',c.value,c.held,c.releaseDue,c.cash]);
   }
   const cell = value => {
     const str = String(value);
@@ -2658,6 +2700,7 @@ function issueMaterialsModal(id) {
 }
 function saveMaterialsIssue(id) {
   const project = db.projects.find(p => p.id === id);
+  requireValue(!project.closed,'This project is closed.');
   const item = db.items.find(i => i.id === val('issueItem'));
   const qty = nvalFrom(document.getElementById('issueQty'));
   const date = val('issueDate'), note = val('issueNote');
@@ -2963,7 +3006,7 @@ function buildImport(kind, sheet, options) {
           requireValue(found.length===1,'Enter a unique existing project ID or name.');
           projectId=found[0].id;
         }
-        requireValue(!projectId || (db.projects||[]).some(p=>p.id===projectId && options.date>=p.start),'Payroll posting date must be on or after the selected project’s start date.');
+        requireValue(!projectId || (db.projects||[]).some(p=>p.id===projectId && !p.closed && options.date>=p.start),'Payroll posting date must be on or after the selected project’s start date.');
         rows.push({ gross,paye,nic,deductions,net,projectId,employer:columns.includes('employer_nic') ?
           importMoney(v.employer_nic,'employer NIC/NIS',true):0 });
       }
@@ -3224,6 +3267,174 @@ function commitIntake() {
 function downloadImportTemplate() {
   const [,headers,...rows]=IMPORT_TYPES[intake.kind];
   downloadFile('IslandBuild-'+intake.kind+'-template.csv',[headers,...rows].join('\r\n')+'\r\n','text/csv;charset=utf-8');
+}
+
+/* Construction contract administration and retention accounting. */
+const RETENTION_ACCOUNT = '1110';
+function job(id) { return (db.projects || []).find(p => p.id === id); }
+function contractInvoices(id) { return db.invoices.filter(i => i.projectId === id && i.source !== 'Retention Release'); }
+function jobCommercial(p) {
+  const invoices = contractInvoices(p.id);
+  const releases = db.invoices.filter(i => i.projectId === p.id && i.source === 'Retention Release');
+  const value = r2((p.contract?.value || 0) + (p.variations || []).reduce((sum,v)=>sum+v.amount,0));
+  const billed = r2(invoices.reduce((sum,i)=>sum+i.subtotal,0));
+  const held = r2(invoices.reduce((sum,i)=>sum+(i.retentionHeld || 0),0) - releases.reduce((sum,i)=>sum+i.total,0));
+  const ordinaryDue = r2(invoices.reduce((sum,i)=>sum+invoiceDue(i),0));
+  const releaseDue = r2(releases.reduce((sum,i)=>sum+invoiceDue(i),0));
+  const cash = r2([...invoices,...releases].reduce((sum,i)=>sum+i.paid,0));
+  const phase = p.closed ? 'Closed' : p.finalAccount ? (ordinaryDue ? 'Awaiting final payment' :
+    held ? 'Retention held' : releaseDue ? 'Awaiting retention payment' : 'Ready to close') :
+    p.signoff ? 'Signed off' : p.status === 'On Hold' ? 'On Hold' :
+    p.contract ? (invoices.length || p.status === 'Active' ? 'In progress' : 'Contract signed') : p.status;
+  return { invoices,releases,value,billed,held,ordinaryDue,releaseDue,cash,phase,remaining:r2(value-billed) };
+}
+function constructionPanel(p) {
+  const f = jobCommercial(p);
+  const button = (action,label) => `<button class="btn-sm" onclick="jobAction('${p.id}','${action}')">${label}</button>`;
+  const payments = [...f.invoices,...f.releases];
+  return `<div class="sec-title">Contract lifecycle</div>
+    <p><strong>${esc(f.phase)}</strong> ${p.contract ? '· Contract '+esc(p.contract.ref)+' · Signed '+esc(p.contract.date) : ''}</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+      ${!p.contract ? button('contract','Record signed contract') : ''}
+      ${p.contract && !p.finalAccount ? button('variation','Approved variation') : ''}
+      ${p.contract && !p.signoff && p.status!=='On Hold' ? button('progress','Progress certificate') : ''}
+      ${p.contract && !p.signoff ? button('signoff','Record completion sign-off') : ''}
+      ${p.signoff && !p.finalAccount ? button('final','Post final account') : ''}
+      ${p.finalAccount && !f.ordinaryDue && f.held>0 ? button('release','Release retention') : ''}
+      ${f.phase==='Ready to close' ? button('close','Close project') : ''}</div>
+    ${!p.contract ? '<p class="muted">Record the signed contract to manage certified claims, sign-off and retention.</p>' : `
+      <div style="overflow:auto"><table><tbody>
+      <tr><th>Original contract ex tax</th><td>${money(p.contract.value)}</td><th>Revised contract ex tax</th><td>${money(f.value)}</td></tr>
+      <tr><th>Certified / billed ex tax</th><td>${money(f.billed)}</td><th>Contract remaining to bill</th><td>${money(f.remaining)}</td></tr>
+      <tr><th>Invoice balance due</th><td>${money(f.ordinaryDue)}</td><th>Cash received</th><td>${money(f.cash)}</td></tr>
+      <tr><th>Unreleased retention</th><td>${money(f.held)}</td><th>Released retention due</th><td>${money(f.releaseDue)}</td></tr>
+      <tr><th>Retention terms</th><td>${p.contract.rate}% before tax${p.contract.cap ? ' · cap '+money(p.contract.cap) : ''}</td>
+      <th>Retention eligible from</th><td>${esc(p.signoff?.releaseDate || 'Set at sign-off')}</td></tr></tbody></table></div>
+      <p class="muted">Certificate billing posts revenue when billed. Retention is withheld from the pre-tax amount. VAT and HSL, where applicable, are charged at certification.</p>
+      ${p.variations?.length ? `<div class="sec-title">Approved variations</div><ul>${p.variations.map(v=>`<li>${esc(v.date)} · ${esc(v.ref)} · ${money(v.amount)} · ${esc(v.note)}</li>`).join('')}</ul>` : ''}
+      ${p.signoff ? `<p><strong>Completion sign-off</strong> · ${esc(p.signoff.date)} · ${esc(p.signoff.person)} · ${esc(p.signoff.ref)}${p.signoff.note ? ' · '+esc(p.signoff.note) : ''}</p>` : ''}
+      ${p.finalAccount ? `<p><strong>Final account</strong> · ${esc(p.finalAccount.date)} · ${esc(p.finalAccount.ref)}</p>` : ''}
+      ${p.closed ? `<p><strong>Closed</strong> · ${esc(p.closed.date)} · ${esc(p.closed.ref)}</p>` : ''}`}
+    ${payments.length ? `<div class="sec-title">Billing, retention and collections</div>
+      <div style="overflow:auto"><table><thead><tr><th>Document</th><th>Certificate / reference</th><th>Total</th><th>Retention withheld</th><th>Paid</th><th>Due</th><th></th></tr></thead>
+      <tbody>${payments.map(i=>`<tr><td><button class="btn-sm" onclick="showInvoice('${i.id}')">${esc(i.id)}</button></td>
+      <td>${esc(i.certificateRef || i.source)}</td><td>${money(i.total)}</td><td>${money(i.retentionHeld||0)}</td><td>${money(i.paid)}</td><td>${money(invoiceDue(i))}</td>
+      <td>${invoiceDue(i)>0 ? `<button class="btn-sm" onclick="payInvoiceModal('${i.id}')">Record payment</button>` : ''}</td></tr>`).join('')}</tbody></table></div>` : ''}`;
+}
+const JOB_ACTIONS = {
+  contract:'Record signed contract',variation:'Record approved variation',progress:'Post progress certificate',
+  signoff:'Record completion sign-off',final:'Post final account',release:'Release retention',close:'Close project'
+};
+function jobAction(id, action) {
+  const p=job(id);
+  const f=jobCommercial(p);
+  const amount=(label,value='',min='0')=>`<div class="field"><label for="lcAmount">${label}</label>
+    <input class="inp" type="number" id="lcAmount" step=".01" ${min!==''?`min="${min}"`:''} value="${value}"></div>`;
+  const date=(name,label,value)=>`<div class="field"><label for="${name}">${label}</label><input class="inp" type="date" id="${name}" value="${value}"></div>`;
+  const text=(name,label)=>`<div class="field"><label for="${name}">${label}</label><input class="inp" id="${name}" maxlength="160"></div>`;
+  const billing=['progress','final'].includes(action);
+  const note=`<div class="field"><label for="lcNote">Description or remarks</label><textarea class="inp" id="lcNote" rows="3"></textarea></div>`;
+  let fields=text('lcRef',action==='contract'?'Signed contract number':'Certificate or approval reference')+date('lcDate','Effective date',today());
+  if (action==='contract') fields+=amount('Original contract amount before VAT and HSL')+
+    `<div class="row"><div class="field"><label for="lcRate">Retention (%)</label><input class="inp" id="lcRate" type="number" min="0" max="100" step=".01" value="0"></div>
+    <div class="field"><label for="lcCap">Retention cap, optional</label><input class="inp" id="lcCap" type="number" min="0" step=".01"></div></div>`;
+  if (action==='variation') fields+=amount('Approved change in contract value. Enter a minus amount for a reduction.','','');
+  if (billing) fields+=amount('Incremental certified amount before VAT and HSL',action==='final'?Math.max(0,f.remaining):'')+
+    date('lcDue','Invoice due date',dayShift(30))+
+    '<p><label><input type="checkbox" id="lcVat" checked> VAT taxable</label> <label><input type="checkbox" id="lcHsl"> HSL eligible</label></p>'+
+    '<div id="lcPreview" aria-live="polite"></div>';
+  if (action==='signoff') fields+=text('lcPerson','Client or certifier signing off')+date('lcDue','Retention eligible for release from',today());
+  if (action==='release') fields+=amount('Amount to release',f.held)+date('lcDue','Retention payment due date',dayShift(30))+
+    '<p class="muted">Moves retention into trade receivables for collection.</p>';
+  openModal(JOB_ACTIONS[action],`<div oninput="updateJobPreview('${id}','${action}')">${fields}${note}</div>`,
+    `<button class="btn ghost" onclick="showProject('${id}')">Back</button><button class="btn" onclick="saveJobAction('${id}','${action}')">${JOB_ACTIONS[action]}</button>`, 'wide');
+  updateJobPreview(id,action);
+}
+function jobRetention(p, amount) {
+  const retained=contractInvoices(p.id).reduce((s,i)=>s+(i.retentionHeld||0),0);
+  const calculated=r2(amount*p.contract.rate/100);
+  return p.contract.cap ? Math.max(0,r2(Math.min(calculated,p.contract.cap-retained))) : calculated;
+}
+function updateJobPreview(id, action) {
+  if (!['progress','final'].includes(action)) return;
+  const amount=nval('lcAmount');
+  const tax=salesTaxes([{qty:1,rate:amount,taxable:document.getElementById('lcVat').checked,hslEligible:document.getElementById('lcHsl').checked}]);
+  const retained=jobRetention(job(id),Math.max(0,amount));
+  document.getElementById('lcPreview').innerHTML=invoiceTaxRows(tax,'style="display:flex;justify-content:space-between"')+
+    `<p>Retention withheld <strong>${money(retained)}</strong> · Collectible now <strong>${money(r2(tax.total-retained))}</strong></p>`;
+}
+function chronologicalJobDate(p) {
+  return [p.contract?.date,p.signoff?.date,p.finalAccount?.date,...(p.variations||[]).map(v=>v.date),
+    ...db.invoices.filter(i=>i.projectId===p.id).map(i=>i.date)].filter(Boolean).sort().at(-1) || '';
+}
+function saveJobAction(id, action) {
+  const p=job(id);
+  requireValue(p && !p.closed,'This project is closed.');
+  const date=val('lcDate'),ref=val('lcRef'),note=val('lcNote'),due=val('lcDue');
+  const amount=val('lcAmount') ? Number(val('lcAmount')) : NaN;
+  const f=jobCommercial(p);
+  requireValue(ref && validDate(date) && date<=today(),'Enter a reference and an effective date through today.');
+  requireValue(action==='contract' || p.contract && date>=chronologicalJobDate(p),'Record the contract first and use dates in chronological order.');
+  const validAmount=Number.isFinite(amount) && r2(amount)===amount && Math.abs(amount)<=1000000000;
+  atomic(()=>{
+    if (action==='contract') {
+      const rate=Number(val('lcRate')),cap=Number(val('lcCap'));
+      requireValue(!p.contract && validAmount && amount>0 && amount>=f.billed &&
+        val('lcRate')!=='' && rate>=0 && rate<=100 && r2(rate)===rate && cap>=0 && cap<=amount && r2(cap)===cap,
+        'Enter a contract value covering prior billings, a valid retention rate and an optional cap within the contract value.');
+      requireValue(!(db.projects||[]).some(other=>other!==p && other.customerId===p.customerId &&
+        other.contract?.ref.toLowerCase()===ref.toLowerCase()),'This customer already has that contract reference.');
+      p.contract={ref,date,note,value:amount,rate,cap};
+      if (p.status==='Complete') p.status='Active';
+    } else if (action==='variation') {
+      requireValue(!p.finalAccount && validAmount && amount!==0 && r2(f.value+amount)>=f.billed && r2(f.value+amount)>0 && note,
+        'Enter a nonzero approved change with a description. The revised value must cover billed work.');
+      requireValue(!(p.variations||[]).some(v=>v.ref.toLowerCase()===ref.toLowerCase()),'This variation is already recorded.');
+      (p.variations ||= []).push({ref,date,note,amount});
+    } else if (action==='progress' || action==='final') {
+      const final=action==='final';
+      requireValue(!p.finalAccount && (final ? p.signoff : !p.signoff && p.status!=='On Hold'),'This certificate is out of sequence.');
+      requireValue(validAmount && (final ? amount===f.remaining : amount>0 && amount<=f.remaining),'Enter an amount within the unbilled contract value. The final account must equal the remaining value.');
+      requireValue(validDate(due) && due>=date,'Enter an invoice due date on or after the certificate date.');
+      requireValue(!f.invoices.some(i=>i.certificateRef?.toLowerCase()===ref.toLowerCase()),'This certificate is already posted.');
+      const inv=amount ? createInvoice({customerId:p.customerId,projectId:p.id,date,dueDate:due,
+        source:final?'Construction Final':'Construction Progress',certificateRef:ref,retentionHeld:jobRetention(p,amount),
+        notes:note,lines:[{desc:(final?'Final account ':'Progress certificate ')+ref,qty:1,rate:amount,
+          revAcct:'4000',taxable:document.getElementById('lcVat').checked,hslEligible:document.getElementById('lcHsl').checked}]}) : null;
+      if (final) p.finalAccount={ref,date,note,invoiceId:inv?.id || ''};
+      else p.status='Active';
+    } else if (action==='signoff') {
+      const person=val('lcPerson');
+      requireValue(!p.signoff && person && validDate(due) && due>=date && date>=p.start && p.tasks.every(t=>t.status==='Done'),
+        'Finish scheduled tasks and enter the signatory and retention release date.');
+      p.signoff={ref,date,releaseDate:due,person,note};
+    } else if (action==='release') {
+      requireValue(p.finalAccount && !f.ordinaryDue && date>=p.signoff.releaseDate && validAmount && amount>0 && amount<=f.held,
+        'Settle the project invoices, reach the retention release date and enter an amount within the retention held.');
+      requireValue(validDate(due) && due>=date,'Enter a retention due date on or after the release date.');
+      requireValue(!f.releases.some(i=>i.certificateRef.toLowerCase()===ref.toLowerCase()),'This retention release is already posted.');
+      const refs=new Set(f.invoices.map(i=>i.id));
+      requireValue(!db.payments.some(payment=>refs.has(payment.ref) && payment.date>date),
+        'The retention release date must be on or after settlement of the project invoices.');
+      const invoice={id:nextNo('INV-','inv'),customerId:p.customerId,projectId:p.id,date,dueDate:due,notes:note,
+        source:'Retention Release',certificateRef:ref,lines:[{desc:'Release of retention · '+ref,qty:1,rate:amount,amount}],
+        subtotal:0,hsl:0,vat:0,vatBase:0,total:amount,paid:0,status:'Open'};
+      post(date,'Construction retention released · '+ref,invoice.id,'Retention Release',
+        [{code:'1100',debit:amount},{code:RETENTION_ACCOUNT,credit:amount}]);
+      db.invoices.push(invoice);
+    } else if (action==='close') {
+      const bills=db.bills.filter(b=>b.projectId===id);
+      requireValue(f.phase==='Ready to close' && bills.every(b=>billDue(b)===0),'Collect all invoices and retention, and settle all linked vendor bills before closing.');
+      const refs=new Set([...f.invoices,...f.releases,...bills].map(i=>i.id));
+      requireValue(!db.payments.some(payment=>refs.has(payment.ref) && payment.date>date),
+        'The closure date must be on or after the last payment.');
+      p.closed={ref,date,note};
+      p.status='Complete';
+    } else throw new Error('Unknown construction action.');
+  });
+  render();
+  showProject(id);
+  toast(JOB_ACTIONS[action]+' recorded','ok');
 }
 
 (function boot() {
