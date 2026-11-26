@@ -689,6 +689,7 @@ function rentalOverdue(r) { return r.status === 'Out' && r.dueDate < today(); }
 const NAV = [
   { group: 'Overview' },
   { id: 'dashboard', label: 'Dashboard', icon: '▦' },
+  { id: 'performance', label: 'Performance Dashboard', icon: '▥' },
   { id: 'ai', label: 'AI Accountant', icon: '🤖' },
   { group: 'Sales' },
   { id: 'pos', label: 'Point of Sale', icon: '▣' },
@@ -743,7 +744,7 @@ function render() {
     const fab = document.getElementById('aiFab');
     if (fab) fab.classList.toggle('hidden', route === 'ai');
 
-    const titles = { dashboard: 'Dashboard', ai: 'AI Accountant Assistant', pos: 'Point of Sale', invoices: 'Sales Invoices — Accounts Receivable',
+    const titles = { dashboard: 'Dashboard', performance: 'Performance Dashboard', ai: 'AI Accountant Assistant', pos: 'Point of Sale', invoices: 'Sales Invoices — Accounts Receivable',
       customers: 'Customers', receipts: 'Payments Received', bills: 'Vendor Bills — Accounts Payable', vendors: 'Vendors',
       disbursements: 'Payments Made', projects: 'Construction Projects', inventory: 'Inventory & Stock', rentals: 'Tool & Equipment Rental Agreements',
       fleet: 'Equipment Fleet', coa: 'Chart of Accounts', journal: 'General Journal', trial: 'Trial Balance',
@@ -751,7 +752,7 @@ function render() {
     document.getElementById('pageTitle').textContent = titles[route] || 'Dashboard';
 
     const v = document.getElementById('view');
-    const fn = { dashboard: viewDashboard, ai: viewAI, pos: viewPOS, invoices: viewInvoices, customers: viewCustomers,
+    const fn = { dashboard: viewDashboard, performance: viewPerformance, ai: viewAI, pos: viewPOS, invoices: viewInvoices, customers: viewCustomers,
       receipts: viewReceipts, bills: viewBills, vendors: viewVendors, disbursements: viewDisbursements,
       projects: viewProjects, inventory: viewInventory, rentals: viewRentals, fleet: viewFleet, coa: viewCOA, journal: viewJournal,
       trial: viewTrial, statements: viewStatements, reports: viewReports, imports: viewIntake, settings: viewSettings }[route] || viewDashboard;
@@ -2083,6 +2084,12 @@ const aiExec = {
 };
 
 function aiLocal(prompt) {
+  if (/\bevm\b|earned value|schedule performance|cost performance/i.test(prompt)) {
+    const jobs=performanceRows();
+    return jobs.length ? jobs.map(({p,evm:e})=>p.name+' · '+(e.bac ?
+      'EV '+money(e.ev)+' · AC '+money(e.ac)+' · CPI '+reportIndex(e.cpi)+' · SPI '+reportIndex(e.spi)+' · EAC '+reportAmount(e.eac) :
+      'Set an EVM baseline')).join('\n') : 'Add a construction project before reporting earned value.';
+  }
   if (/retention|contract status|construction closeout/i.test(prompt)) {
     const projects=(db.projects||[]).filter(p=>p.contract);
     return projects.length ? projects.map(p=>{
@@ -2473,15 +2480,16 @@ function projectPicker(id) {
       .map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>`;
 }
 
-function projectFigures(projectId) {
-  const invoices = db.invoices.filter(i => i.projectId === projectId);
-  const bills = db.bills.filter(b => b.projectId === projectId);
+function projectFigures(projectId, asOf) {
+  const posted = record => !asOf || record.date <= asOf;
+  const invoices = db.invoices.filter(i => i.projectId === projectId && posted(i));
+  const bills = db.bills.filter(b => b.projectId === projectId && posted(b));
   const costRefs = new Set([...invoices.map(i => i.id), ...bills.map(b => b.id)]);
-  const payrollCost = r2(db.gl.filter(e=>e.source==='Caribbean Payroll')
+  const payrollCost = r2(db.gl.filter(e=>e.source==='Caribbean Payroll' && posted(e))
     .flatMap(e=>e.lines).filter(l=>l.projectId===projectId && account(l.code)?.type==='Expense')
     .reduce((sum,l)=>sum+l.debit-l.credit,0));
-  const costs = db.gl.filter(e => costRefs.has(e.ref) && ['Sales', 'COGS', 'Purchase'].includes(e.source) ||
-    e.ref === projectId && e.source === 'Job Materials')
+  const costs = db.gl.filter(e => posted(e) && (costRefs.has(e.ref) && ['Sales', 'COGS', 'Purchase'].includes(e.source) ||
+    e.ref === projectId && e.source === 'Job Materials'))
     .flatMap(e => e.lines).filter(l => account(l.code)?.type === 'Expense')
     .reduce((sum, l) => sum + l.debit - l.credit, 0);
   const billed = r2(invoices.reduce((sum, i) => sum + i.subtotal, 0));
@@ -2568,6 +2576,7 @@ function showProject(id) {
       <tr><th>Budget remaining</th><td>${money(p.budget - f.costs)}</td><th>Margin on posted work</th><td>${money(f.margin)}</td></tr>
       <tr><th>Allocated payroll included in cost</th><td colspan="3">${money(f.payrollCost)}</td></tr>
       <tr><th>Billed ex tax</th><td>${money(f.billed)}</td><th>Trade balance due</th><td>${money(f.due)}</td></tr></tbody></table>
+    <button class="btn-sm" onclick="closeModal();go('performance');selectPerformanceProject('${p.id}')">View earned value and performance</button>
     ${projectControls(p,f)}
     ${constructionPanel(p)}
     <div class="sec-title">Work schedule</div>
@@ -3583,6 +3592,213 @@ function chooseBillingMilestone(id) {
   const task=job(id).tasks.find(t=>t.id===val('lcMilestone'));
   document.getElementById('lcAmount').value=task?.billingValue ?? '';
   updateJobPreview(id,'progress');
+}
+
+/* Project controls use budget-weighted physical progress and posted job costs. */
+function evmPlan(p) {
+  return p.evm?.plans?.at(-1);
+}
+function evmMetrics(p, actual, date=today()) {
+  const plan=evmPlan(p);
+  const ac=r2(actual);
+  if (!plan) return {ac};
+  let pv=0, ev=0;
+  for (const w of plan.packages) {
+    const elapsed=(Date.parse(date)-Date.parse(w.start))/86400000;
+    const duration=(Date.parse(w.finish)-Date.parse(w.start))/86400000+1;
+    pv+=w.budget*Math.max(0,Math.min(1,(elapsed+1)/duration));
+    const current=p.evm.progress[w.id];
+    ev+=w.budget*(current?.date<=date ? current.percent/100 : 0);
+  }
+  pv=r2(pv); ev=r2(ev);
+  const cpi=ac>0 ? ev/ac : null, spi=pv>0 ? ev/pv : null;
+  const complete=ev>=plan.bac;
+  const eac=complete ? ac : cpi>0 ? r2(plan.bac/cpi) : null;
+  return {ac,bac:plan.bac,pv,ev,cpi,spi,eac,cv:r2(ev-ac),sv:r2(ev-pv),
+    etc:eac===null ? null : r2(eac-ac),vac:eac===null ? null : r2(plan.bac-eac)};
+}
+function evmPlanModal(id) {
+  const p=job(id), prior=evmPlan(p);
+  const contingency=p.terms?.contingency || 0;
+  const target=r2(p.budget-contingency);
+  openModal(prior?'Approve revised EVM baseline':'Approve EVM baseline',`
+    <p>Allocate ${money(target)} of the approved cost budget across scheduled work packages. Contingency of
+      ${money(contingency)} stays outside the EVM baseline. Add tasks in Construction Projects to create work packages.</p>
+    ${termField('evmRef','Baseline approval reference')}
+    ${prior?termField('evmReason','Approved change or reason for rebaselining'):''}
+    <div style="overflow:auto"><table><thead><tr><th>Work package</th><th>Planned start</th><th>Scheduled finish</th><th>Budget (XCD)</th></tr></thead>
+    <tbody>${p.tasks.map(t=>{
+      const old=prior?.packages.find(w=>w.id===t.id);
+      return `<tr><td>${esc(t.name)}</td><td><input class="inp" aria-label="Start for ${esc(t.name)}" id="evmStart_${t.id}" type="date" value="${esc(old?.start || p.start)}"></td>
+        <td>${esc(t.due)}</td><td><input class="inp" aria-label="Budget for ${esc(t.name)}" id="evmBudget_${t.id}" type="number" min="0" step=".01" value="${old?.budget ?? 0}"></td></tr>`;
+    }).join('')}</tbody></table></div>
+    <p class="muted">A zero budget excludes a task from earned value. Planned value is spread evenly over each package’s calendar days.</p>`,
+    `<button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveEvmPlan('${id}')">Approve baseline</button>`,'wide');
+}
+function saveEvmPlan(id) {
+  atomic(()=>{
+    const p=job(id), prior=evmPlan(p);
+    const target=r2(p.budget-(p.terms?.contingency || 0));
+    const ref=val('term_evmRef'), reason=val('term_evmReason');
+    requireValue(!p.closed && ref && (!prior || reason),'Enter the approval reference and, for a revised baseline, the reason.');
+    requireValue(!(p.evm?.plans||[]).some(b=>b.ref.toLowerCase()===ref.toLowerCase()),'This baseline approval reference already exists.');
+    const packages=p.tasks.flatMap(t=>{
+      const budget=Number(val('evmBudget_'+t.id)),start=val('evmStart_'+t.id);
+      requireValue(Number.isFinite(budget) && budget>=0 && budget<=1e9 && budget===r2(budget),'Enter a valid budget for '+t.name+'.');
+      if (!budget) return [];
+      requireValue(validDate(start) && validDate(t.due) && start>=p.start && start<=t.due && t.due<=p.due,
+        'Enter planned dates within the project schedule for '+t.name+'.');
+      return [{id:t.id,name:t.name,budget,start,finish:t.due}];
+    });
+    requireValue(target>0 && r2(packages.reduce((sum,w)=>sum+w.budget,0))===target,
+      'Work package budgets must add up to '+money(target)+'.');
+    p.evm ||= {plans:[],progress:{},updates:[]};
+    p.evm.plans.push({date:today(),ref,reason,bac:target,packages});
+  });
+  closeModal(); render(); toast('EVM baseline saved','ok');
+}
+function evmProgressModal(id) {
+  const p=job(id), plan=evmPlan(p);
+  openModal('Record physical progress',`
+    <p>Enter cumulative physical completion for each work package, supported by measurements, inspections or other evidence.</p>
+    ${termField('evmEvidence','Progress evidence or inspection reference')}
+    <table><thead><tr><th>Work package</th><th>Complete (%)</th></tr></thead><tbody>
+      ${plan.packages.map(w=>`<tr><td>${esc(w.name)}</td><td><input class="inp" aria-label="Completion for ${esc(w.name)}"
+        id="evmPercent_${w.id}" type="number" min="0" max="100" step=".01" value="${p.evm.progress[w.id]?.percent ?? 0}"></td></tr>`).join('')}
+    </tbody></table>`,
+    `<button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveEvmProgress('${id}')">Record progress</button>`,'wide');
+}
+function saveEvmProgress(id) {
+  atomic(()=>{
+    const p=job(id), plan=evmPlan(p), evidence=val('term_evmEvidence');
+    requireValue(!p.closed && plan && evidence,'An active baseline and progress evidence are required.');
+    const changes=plan.packages.flatMap(w=>{
+      const raw=val('evmPercent_'+w.id), percent=Number(raw), previous=p.evm.progress[w.id]?.percent ?? 0;
+      requireValue(raw && Number.isFinite(percent) && percent>=0 && percent<=100 && r2(percent)===percent,
+        'Enter a completion percentage between 0 and 100 for '+w.name+'.');
+      return percent===previous?[]:[{id:w.id,previous,percent}];
+    });
+    requireValue(changes.length,'Change at least one progress percentage before recording.');
+    const date=today();
+    for (const c of changes) p.evm.progress[c.id]={date,percent:c.percent,evidence};
+    p.evm.updates.push({date,baseline:plan.ref,evidence,changes});
+  });
+  closeModal(); render(); toast('Physical progress saved','ok');
+}
+function performanceData(month) {
+  const eligible=db.gl.filter(e=>e.date<=today() && e.date.startsWith(month+'-'));
+  let revenue=0, expense=0;
+  for (const e of eligible) for (const l of e.lines) {
+    const type=account(l.code)?.type;
+    if (type==='Revenue') revenue+=l.credit-l.debit;
+    if (type==='Expense') expense+=l.debit-l.credit;
+  }
+  const receipts=db.payments.filter(p=>p.type==='received' && p.date<=today() && p.date.startsWith(month+'-')).reduce((sum,p)=>sum+p.amount,0);
+  const futureReceipts=new Map();
+  for (const payment of db.payments)
+    if (payment.type==='received' && payment.date>today())
+      futureReceipts.set(payment.ref,(futureReceipts.get(payment.ref)||0)+payment.amount);
+  const overdue=db.invoices.filter(i=>i.date<=today() && i.dueDate<today())
+    .reduce((sum,i)=>sum+invoiceDue(i)+(futureReceipts.get(i.id)||0),0);
+  const inventory=db.items.filter(i=>i.type==='Inventory');
+  const fleet=db.items.filter(i=>i.type==='Rental');
+  const fleetSize=fleet.reduce((sum,i)=>sum+i.qty,0);
+  const out=fleet.reduce((sum,i)=>sum+(i.onRent||0),0);
+  return {revenue:r2(revenue),expense:r2(expense),profit:r2(revenue-expense),receipts:r2(receipts),overdue:r2(overdue),
+    cash:r2(['1000','1010','1020'].reduce((sum,code)=>sum+acctBalance(code,today()),0)),
+    ar:acctBalance('1100',today()),ap:acctBalance('2000',today()),retention:acctBalance('1110',today()),
+    lowStock:inventory.filter(i=>i.qty<=i.reorder).length, overdueRentals:db.rentals.filter(rentalOverdue).length,
+    utilization:fleetSize ? out/fleetSize : null};
+}
+function performanceRows() {
+  return (db.projects||[]).map(p=>{
+    const jobStatus=jobCommercial(p), costs=projectFigures(p.id,today());
+    return {p,jobStatus,costs,evm:evmMetrics(p,costs.costs)};
+  });
+}
+const reportAmount = value => value==null?'—':money(value);
+const reportIndex = value => value==null?'—':value.toFixed(2);
+function viewPerformance() {
+  const month=ui.performanceMonth || today().slice(0,7), data=performanceData(month);
+  const projects=performanceRows();
+  const selected=projects.find(row=>row.p.id===ui.performanceProject) || projects[0];
+  const card=(label,value)=>`<div class="card"><div class="card-b"><div class="muted">${label}</div>
+    <strong style="font-size:22px">${value}</strong></div></div>`;
+  const row=(cells)=>`<tr>${cells.map(value=>`<td>${value}</td>`).join('')}</tr>`;
+  const table=(headers,rows)=>`<div style="overflow:auto"><table><thead><tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
+    <tbody>${rows.join('')}</tbody></table></div>`;
+  const report=selected?.evm;
+  const plan=selected && evmPlan(selected.p);
+  const barMax=plan ? Math.max(plan.bac,report.ac,report.ev,report.pv,1) : 1;
+  const valueBars=plan ? [['Planned value',report.pv,'#2563eb'],['Earned value',report.ev,'#078565'],['Actual cost',report.ac,'#c36218']]
+    .map(([label,value,color])=>`<div style="display:grid;grid-template-columns:minmax(90px,130px) 1fr minmax(90px,auto);gap:8px;align-items:center;margin:7px 0">
+      <span>${label}</span><div style="background:#e2e8f0;border-radius:5px;height:10px">
+        <div style="height:10px;border-radius:5px;background:${color};width:${Math.max(0,100*value/barMax)}%"></div></div>
+      <strong style="text-align:right">${money(value)}</strong></div>`).join('') : '';
+  const active=projects.filter(x=>!x.p.closed && x.p.status!=='Complete').length;
+  const behind=projects.filter(x=>!x.p.closed && x.evm.spi!=null && x.evm.spi<1).length;
+  const over=projects.filter(x=>!x.p.closed && x.evm.cpi!=null && x.evm.cpi<1).length;
+  return `<div class="card"><div class="card-h"><h3>Business performance</h3>
+      <label>Reporting month <input class="inp" type="month" value="${esc(month)}" onchange="ui.performanceMonth=this.value;render()"></label></div>
+    <div class="card-b"><div class="grid g4">${[
+      ['Revenue',money(data.revenue)],['Expenses',money(data.expense)],['Ledger profit / (loss)',money(data.profit)],
+      ['Customer receipts',money(data.receipts)]
+    ].map(args=>card(...args)).join('')}</div></div></div>
+    <div class="card" style="margin-top:16px"><div class="card-h"><h3>Cash, working capital and operations · today</h3></div>
+      <div class="card-b"><div class="grid g4">${[
+        ['Cash and bank',money(data.cash)],['Trade receivables',money(data.ar)],['Overdue invoices',money(data.overdue)],
+        ['Trade payables',money(data.ap)],['Unreleased retention (ledger)',money(data.retention)],
+        ['Rental fleet out',data.utilization==null?'—':(data.utilization*100).toFixed(0)+'%'],
+        ['Overdue rentals',data.overdueRentals],['Items at or below reorder point',data.lowStock]
+      ].map(args=>card(...args)).join('')}</div></div></div>
+    <div class="card" style="margin-top:16px"><div class="card-h"><h3>Construction portfolio</h3>
+      <button class="btn-sm" onclick="exportPerformance()">Export project metrics CSV</button></div>
+      <div class="card-b"><p>${active} open projects · ${behind} below schedule plan · ${over} below cost efficiency target</p>
+      ${table(['Project','Revised contract','Billed ex tax','Cash received','Trade due','Retention held','Actual cost','Billed margin','CPI','SPI'],
+        projects.map(({p,jobStatus:j,costs:f,evm:e})=>row([`<button class="btn-sm" onclick="selectPerformanceProject('${p.id}')">${esc(p.name)}</button>`,
+          p.contract?money(j.value):'—',money(f.billed),money(j.cash),money(f.due),money(j.held),money(e.ac),money(f.margin),reportIndex(e.cpi),reportIndex(e.spi)])))}
+      ${projects.length?'':'<p class="muted">Add construction projects to report job performance.</p>'}</div></div>
+    ${selected?`<div class="card" id="evmDetail" style="margin-top:16px"><div class="card-h"><h3>Earned value · ${esc(selected.p.name)}</h3>
+      <div>${!selected.p.closed?`<button class="btn-sm" onclick="evmPlanModal('${selected.p.id}')">${plan?'Revise baseline':'Set baseline'}</button>
+      ${plan?`<button class="btn" onclick="evmProgressModal('${selected.p.id}')">Record physical progress</button>`:''}`:''}</div></div>
+      <div class="card-b">${plan?`<p>Baseline ${esc(plan.ref)} · approved ${esc(plan.date)} · ${selected.p.evm.plans.length} version(s)${selected.p.evm.updates.length?
+        ' · Latest progress '+esc(selected.p.evm.updates.at(-1).date)+' · '+esc(selected.p.evm.updates.at(-1).evidence):''}</p>
+      ${r2(selected.p.budget-(selected.p.terms?.contingency||0))!==plan.bac?'<p class="pill warn">Approved budget differs from the current EVM baseline. Review the baseline before interpreting the indices.</p>':''}
+      <div class="grid g4">${[['Budget at completion (BAC)',report.bac],['Planned value (PV)',report.pv],['Earned value (EV)',report.ev],
+      ['Actual cost (AC)',report.ac],['Cost variance (CV)',report.cv],['Schedule variance (SV)',report.sv],
+      ['Forecast at completion (EAC)',report.eac],['Forecast variance (VAC)',report.vac],['Forecast remaining cost (ETC)',report.etc]]
+      .map(([label,value])=>card(label,reportAmount(value))).join('')}
+      ${card('Cost performance (CPI)',reportIndex(report.cpi))}${card('Schedule performance (SPI)',reportIndex(report.spi))}</div>
+      <div style="margin-top:16px">${valueBars}</div>
+      <h3 style="margin-top:16px">Work packages</h3>
+      ${table(['Package','Start','Finish','Baseline budget','Physical complete','Evidence'],plan.packages.map(w=>{
+        const progress=selected.p.evm.progress[w.id];
+        return row([esc(w.name),esc(w.start),esc(w.finish),money(w.budget),(progress?.percent??0)+'%',esc(progress?.evidence || '—')]);
+      }))}
+      <details style="margin-top:12px"><summary>Baseline and progress history</summary>
+      ${table(['Approval','Approved on','Budget','Reason'],selected.p.evm.plans.map(b=>
+        row([esc(b.ref),esc(b.date),money(b.bac),esc(b.reason||'Original baseline')])))}
+      ${table(['Update date','Baseline','Evidence','Changes'],selected.p.evm.updates.map(u=>
+        row([esc(u.date),esc(u.baseline),esc(u.evidence),u.changes.length])))}</details>
+      <p class="muted">CPI or SPI below 1 indicates lower cost or schedule performance. EAC uses BAC ÷ CPI while work remains. Schedule variance is a budget value. Planned value assumes even daily progress within each work package.</p>`
+      :'<p class="muted">Set a baseline by assigning the approved work budget to scheduled tasks, then record measured physical completion.</p>'}</div></div>`:''}`;
+}
+function selectPerformanceProject(id) {
+  ui.performanceProject=id;
+  render();
+  document.getElementById('evmDetail')?.scrollIntoView({block:'start'});
+}
+function exportPerformance() {
+  const lines=[['Project','As of','Baseline approval','BAC XCD','PV XCD','EV XCD','AC XCD','CV XCD','SV XCD','CPI','SPI',
+    'EAC XCD','ETC XCD','VAC XCD','Billed ex tax XCD','Billed margin XCD','Cash received XCD','Trade due XCD','Retention held XCD']];
+  for (const {p,costs:f,jobStatus:j,evm:e} of performanceRows()) lines.push([p.name,today(),evmPlan(p)?.ref,e.bac,e.pv,e.ev,e.ac,e.cv,e.sv,
+    e.cpi,e.spi,e.eac,e.etc,e.vac,f.billed,f.margin,j.cash,f.due,j.held]);
+  const csv=lines.map(row=>row.map(value=>{
+    let text=String(value??'');
+    if (typeof value==='string' && /^[\s]*[=+@-]/.test(text)) text="'"+text;
+    return '"'+text.replaceAll('"','""')+'"';
+  }).join(',')).join('\r\n');
+  downloadFile('islandbuild-performance-'+today()+'.csv',csv,'text/csv;charset=utf-8');
 }
 
 (function boot() {
