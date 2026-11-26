@@ -170,6 +170,11 @@
     .topbar .meta{display:none}
     .modal-b{overflow-x:auto}
   }
+  .metric-drill{display:block;width:100%;text-align:left;background:var(--panel);color:inherit;font:inherit;cursor:pointer}
+  .metric-drill:hover,.metric-drill:focus-visible{border-color:#0284c7;outline:2px solid #0284c7;outline-offset:1px}
+  .performance-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+  .performance-tabs [aria-pressed="true"]{background:#0c4a6e;color:white}
+  .metric-drill .card-b{display:block}
 </style>
 </head>
 <body>
@@ -721,7 +726,7 @@ function renderNav() {
   try {
     navEl.innerHTML = NAV.map(n => n.group
       ? `<div class="nav-group">${n.group}</div>`
-      : `<a class="${route === n.id ? 'active' : ''}" onclick="go('${n.id}')"><span class="ic">${n.icon || '•'}</span>${n.label}</a>`
+      : `<a class="${route === n.id ? 'active' : ''}" href="#${n.id}" ${route === n.id ? 'aria-current="page"' : ''} onclick="event.preventDefault();go('${n.id}')"><span class="ic">${n.icon || '•'}</span>${n.label}</a>`
     ).join('');
   } catch (e) {
     console.error('Nav render failed:', e);
@@ -3598,17 +3603,20 @@ function chooseBillingMilestone(id) {
 function evmPlan(p) {
   return p.evm?.plans?.at(-1);
 }
+function evmPackageValues(w,progress,date) {
+  const elapsed=(Date.parse(date)-Date.parse(w.start))/86400000;
+  const duration=(Date.parse(w.finish)-Date.parse(w.start))/86400000+1;
+  return {pv:w.budget*Math.max(0,Math.min(1,(elapsed+1)/duration)),
+    ev:w.budget*(progress?.date<=date ? progress.percent/100 : 0)};
+}
 function evmMetrics(p, actual, date=today()) {
   const plan=evmPlan(p);
   const ac=r2(actual);
   if (!plan) return {ac};
   let pv=0, ev=0;
   for (const w of plan.packages) {
-    const elapsed=(Date.parse(date)-Date.parse(w.start))/86400000;
-    const duration=(Date.parse(w.finish)-Date.parse(w.start))/86400000+1;
-    pv+=w.budget*Math.max(0,Math.min(1,(elapsed+1)/duration));
-    const current=p.evm.progress[w.id];
-    ev+=w.budget*(current?.date<=date ? current.percent/100 : 0);
+    const values=evmPackageValues(w,p.evm.progress[w.id],date);
+    pv+=values.pv; ev+=values.ev;
   }
   pv=r2(pv); ev=r2(ev);
   const cpi=ac>0 ? ev/ac : null, spi=pv>0 ? ev/pv : null;
@@ -3722,8 +3730,15 @@ function viewPerformance() {
   const month=ui.performanceMonth || today().slice(0,7), data=performanceData(month);
   const projects=performanceRows();
   const selected=projects.find(row=>row.p.id===ui.performanceProject) || projects[0];
-  const card=(label,value)=>`<div class="card"><div class="card-b"><div class="muted">${label}</div>
-    <strong style="font-size:22px">${value}</strong></div></div>`;
+  const tab=ui.performanceTab || 'business';
+  const tabBar=`<nav class="performance-tabs" aria-label="Performance views">${Object.entries(PERFORMANCE_TABS).map(([name,label])=>
+    `<button class="btn-sm" id="performance-tab-${name}" aria-pressed="${tab===name}" onclick="performanceTab('${name}')">${label}</button>`).join('')}</nav>`;
+  const card=(key,value,evm=false)=>`<button class="card metric-drill" onclick="${evm?
+    `evmPerformanceMetric('${key}','${selected.p.id}')`:`performanceMetric('${key}')`}"><span class="card-b">
+    <span class="muted">${evm?EVM_METRICS[key][0]:PERFORMANCE_METRICS[key]}</span><br>
+    <strong style="font-size:22px">${value}</strong></span></button>`;
+  const measure=(key,id,value,evm=false)=>`<button class="btn-sm" aria-label="${esc((evm?
+    EVM_METRICS[key][0]:key[0].toUpperCase()+key.slice(1))+' for '+job(id).name+' · '+value)}" onclick="${evm?'evmPerformanceMetric':'projectPerformanceMetric'}('${key}','${id}')">${value}</button>`;
   const row=(cells)=>`<tr>${cells.map(value=>`<td>${value}</td>`).join('')}</tr>`;
   const table=(headers,rows)=>`<div style="overflow:auto"><table><thead><tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
     <tbody>${rows.join('')}</tbody></table></div>`;
@@ -3738,42 +3753,49 @@ function viewPerformance() {
   const active=projects.filter(x=>!x.p.closed && x.p.status!=='Complete').length;
   const behind=projects.filter(x=>!x.p.closed && x.evm.spi!=null && x.evm.spi<1).length;
   const over=projects.filter(x=>!x.p.closed && x.evm.cpi!=null && x.evm.cpi<1).length;
-  return `<div class="card"><div class="card-h"><h3>Business performance</h3>
+  return tabBar+`${tab==='business'?`<div class="card"><div class="card-h"><h3>Business performance</h3>
       <label>Reporting month <input class="inp" type="month" value="${esc(month)}" onchange="ui.performanceMonth=this.value;render()"></label></div>
     <div class="card-b"><div class="grid g4">${[
-      ['Revenue',money(data.revenue)],['Expenses',money(data.expense)],['Ledger profit / (loss)',money(data.profit)],
-      ['Customer receipts',money(data.receipts)]
+      ['revenue',money(data.revenue)],['expense',money(data.expense)],['profit',money(data.profit)],
+      ['receipts',money(data.receipts)]
     ].map(args=>card(...args)).join('')}</div></div></div>
-    <div class="card" style="margin-top:16px"><div class="card-h"><h3>Cash, working capital and operations · today</h3></div>
+    ` : ''}${tab==='operations'?`<div class="card"><div class="card-h"><h3>Cash, working capital and operations · today</h3></div>
       <div class="card-b"><div class="grid g4">${[
-        ['Cash and bank',money(data.cash)],['Trade receivables',money(data.ar)],['Overdue invoices',money(data.overdue)],
-        ['Trade payables',money(data.ap)],['Unreleased retention (ledger)',money(data.retention)],
-        ['Rental fleet out',data.utilization==null?'—':(data.utilization*100).toFixed(0)+'%'],
-        ['Overdue rentals',data.overdueRentals],['Items at or below reorder point',data.lowStock]
+        ['cash',money(data.cash)],['ar',money(data.ar)],['overdue',money(data.overdue)],
+        ['ap',money(data.ap)],['retention',money(data.retention)],
+        ['utilization',data.utilization==null?'—':(data.utilization*100).toFixed(0)+'%'],
+        ['overdueRentals',data.overdueRentals],['lowStock',data.lowStock]
       ].map(args=>card(...args)).join('')}</div></div></div>
-    <div class="card" style="margin-top:16px"><div class="card-h"><h3>Construction portfolio</h3>
+    ` : ''}${tab==='portfolio'?`<div class="card"><div class="card-h"><h3>Construction portfolio</h3>
       <button class="btn-sm" onclick="exportPerformance()">Export project metrics CSV</button></div>
       <div class="card-b"><p>${active} open projects · ${behind} below schedule plan · ${over} below cost efficiency target</p>
       ${table(['Project','Revised contract','Billed ex tax','Cash received','Trade due','Retention held','Actual cost','Billed margin','CPI','SPI'],
-        projects.map(({p,jobStatus:j,costs:f,evm:e})=>row([`<button class="btn-sm" onclick="selectPerformanceProject('${p.id}')">${esc(p.name)}</button>`,
-          p.contract?money(j.value):'—',money(f.billed),money(j.cash),money(f.due),money(j.held),money(e.ac),money(f.margin),reportIndex(e.cpi),reportIndex(e.spi)])))}
+        projects.map(({p,jobStatus:j,costs:f,evm:e})=>row([
+          `<button class="btn-sm" onclick="showProject('${p.id}')">${esc(p.name)}</button> <button class="btn-sm" onclick="selectPerformanceProject('${p.id}')">EVM</button>`,
+          measure('contract',p.id,p.contract?money(j.value):'—'),measure('billed',p.id,money(f.billed)),measure('cash',p.id,money(j.cash)),
+          measure('due',p.id,money(f.due)),measure('retention',p.id,money(j.held)),measure('cost',p.id,money(e.ac)),
+          measure('margin',p.id,money(f.margin)),e.bac?measure('cpi',p.id,reportIndex(e.cpi),true):'—',
+          e.bac?measure('spi',p.id,reportIndex(e.spi),true):'—'])))}
       ${projects.length?'':'<p class="muted">Add construction projects to report job performance.</p>'}</div></div>
-    ${selected?`<div class="card" id="evmDetail" style="margin-top:16px"><div class="card-h"><h3>Earned value · ${esc(selected.p.name)}</h3>
+    ` : ''}${tab==='evm'?`<div class="card">
+      <div class="card-b"><label for="evmProjectSelect">Project</label>
+      <select class="inp" id="evmProjectSelect" onchange="selectPerformanceProject(this.value)">
+        ${projects.map(({p})=>`<option value="${p.id}" ${selected?.p.id===p.id?'selected':''}>${esc(p.name)}</option>`).join('')}
+      </select>${!selected?'<p class="muted">Add a construction project to report earned value.</p>':''}</div></div>`:''}
+    ${tab==='evm' && selected?`<div class="card" id="evmDetail" style="margin-top:16px"><div class="card-h"><h3>Earned value · ${esc(selected.p.name)}</h3>
       <div>${!selected.p.closed?`<button class="btn-sm" onclick="evmPlanModal('${selected.p.id}')">${plan?'Revise baseline':'Set baseline'}</button>
       ${plan?`<button class="btn" onclick="evmProgressModal('${selected.p.id}')">Record physical progress</button>`:''}`:''}</div></div>
       <div class="card-b">${plan?`<p>Baseline ${esc(plan.ref)} · approved ${esc(plan.date)} · ${selected.p.evm.plans.length} version(s)${selected.p.evm.updates.length?
         ' · Latest progress '+esc(selected.p.evm.updates.at(-1).date)+' · '+esc(selected.p.evm.updates.at(-1).evidence):''}</p>
       ${r2(selected.p.budget-(selected.p.terms?.contingency||0))!==plan.bac?'<p class="pill warn">Approved budget differs from the current EVM baseline. Review the baseline before interpreting the indices.</p>':''}
-      <div class="grid g4">${[['Budget at completion (BAC)',report.bac],['Planned value (PV)',report.pv],['Earned value (EV)',report.ev],
-      ['Actual cost (AC)',report.ac],['Cost variance (CV)',report.cv],['Schedule variance (SV)',report.sv],
-      ['Forecast at completion (EAC)',report.eac],['Forecast variance (VAC)',report.vac],['Forecast remaining cost (ETC)',report.etc]]
-      .map(([label,value])=>card(label,reportAmount(value))).join('')}
-      ${card('Cost performance (CPI)',reportIndex(report.cpi))}${card('Schedule performance (SPI)',reportIndex(report.spi))}</div>
+      <div class="grid g4">${Object.keys(EVM_METRICS).map(key=>
+        card(key,key==='cpi'||key==='spi'?reportIndex(report[key]):reportAmount(report[key]),true)).join('')}</div>
       <div style="margin-top:16px">${valueBars}</div>
       <h3 style="margin-top:16px">Work packages</h3>
       ${table(['Package','Start','Finish','Baseline budget','Physical complete','Evidence'],plan.packages.map(w=>{
         const progress=selected.p.evm.progress[w.id];
-        return row([esc(w.name),esc(w.start),esc(w.finish),money(w.budget),(progress?.percent??0)+'%',esc(progress?.evidence || '—')]);
+        return row([`<button class="btn-sm" onclick="evmPerformanceMetric('ev','${selected.p.id}','${w.id}')">${esc(w.name)}</button>`,
+          esc(w.start),esc(w.finish),money(w.budget),(progress?.percent??0)+'%',esc(progress?.evidence || '—')]);
       }))}
       <details style="margin-top:12px"><summary>Baseline and progress history</summary>
       ${table(['Approval','Approved on','Budget','Reason'],selected.p.evm.plans.map(b=>
@@ -3785,8 +3807,9 @@ function viewPerformance() {
 }
 function selectPerformanceProject(id) {
   ui.performanceProject=id;
+  ui.performanceTab='evm';
   render();
-  document.getElementById('evmDetail')?.scrollIntoView({block:'start'});
+  document.getElementById('evmDetail')?.scrollIntoView?.({block:'start'});
 }
 function exportPerformance() {
   const lines=[['Project','As of','Baseline approval','BAC XCD','PV XCD','EV XCD','AC XCD','CV XCD','SV XCD','CPI','SPI',
@@ -3799,6 +3822,199 @@ function exportPerformance() {
     return '"'+text.replaceAll('"','""')+'"';
   }).join(',')).join('\r\n');
   downloadFile('islandbuild-performance-'+today()+'.csv',csv,'text/csv;charset=utf-8');
+}
+
+/* Read-only details for Performance Dashboard indicators. */
+const PERFORMANCE_TABS = {
+  business:'Business performance', operations:'Cash & operations', portfolio:'Construction portfolio', evm:'Earned value'
+};
+const PERFORMANCE_METRICS = {
+  revenue:'Revenue', expense:'Expenses', profit:'Ledger profit / (loss)', receipts:'Customer receipts',
+  cash:'Cash and bank', ar:'Trade receivables', overdue:'Overdue invoices', ap:'Trade payables',
+  retention:'Unreleased retention (ledger)', utilization:'Rental fleet out', overdueRentals:'Overdue rentals',
+  lowStock:'Items at or below reorder point'
+};
+const EVM_METRICS = {
+  bac:['Budget at completion (BAC)','Total approved work-package budgets, excluding contingency.'],
+  pv:['Planned value (PV)','Sum of each package’s budget multiplied by its planned completion. Planned completion is spread evenly across scheduled calendar days.'],
+  ev:['Earned value (EV)','Sum of work-package budgets multiplied by measured physical completion.'],
+  ac:['Actual cost (AC)','Posted job expense lines from linked bills and sales, issued materials and allocated payroll.'],
+  cv:['Cost variance (CV)','Earned value minus actual cost.'],
+  sv:['Schedule variance (SV)','Earned value minus planned value, expressed in dollars.'],
+  cpi:['Cost performance (CPI)','Earned value divided by actual cost.'],
+  spi:['Schedule performance (SPI)','Earned value divided by planned value.'],
+  eac:['Forecast at completion (EAC)','Budget at completion divided by CPI while work remains. At full physical completion, EAC equals actual cost.'],
+  etc:['Forecast remaining cost (ETC)','Estimate at completion minus actual cost.'],
+  vac:['Forecast variance (VAC)','Budget at completion minus estimate at completion.']
+};
+function performanceTab(name) {
+  if (!Object.hasOwn(PERFORMANCE_TABS,name)) return;
+  ui.performanceTab=name;
+  render();
+  document.getElementById('performance-tab-'+name)?.focus();
+}
+function drillTable(headers,rows) {
+  return `<div style="overflow:auto"><table><thead><tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
+    <tbody>${rows.length ? rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('') :
+    `<tr><td colspan="${headers.length}" class="empty">No records for this selection.</td></tr>`}</tbody></table></div>`;
+}
+function drillButton(label,kind,id) {
+  return `<button class="btn-sm" onclick="performanceSource('${kind}','${esc(id)}')">${esc(label)}</button>`;
+}
+function drillJournal(entries,include=()=>true) {
+  return drillTable(['Date','Reference','Memo','Account','Debit','Credit'],entries.slice().sort((a,b)=>b.date.localeCompare(a.date)).flatMap(e=>
+    e.lines.filter(l=>include(l,e)).map(l=>[esc(e.date),drillButton(e.ref || 'Journal entry','journal',e.id),esc(e.memo),
+      esc(l.code+' · '+(account(l.code)?.name||'')),money(l.debit),money(l.credit)])));
+}
+function drillInvoices(records,due=invoiceDue) {
+  return drillTable(['Invoice','Customer','Issued','Due date','Total','Retention withheld','Outstanding'],records.map(i=>[
+    drillButton(i.id,'invoice',i.id),esc(customerName(i.customerId)),esc(i.date),esc(i.dueDate),
+    money(i.total),money(i.retentionHeld||0),money(due(i))]));
+}
+function drillReceipts(payments) {
+  return drillTable(['Date','Receipt','Customer','Invoice','Method','Account','Amount'],payments.map(p=>[
+    esc(p.date),esc(p.id),esc(customerName(p.partyId)),db.invoices.some(i=>i.id===p.ref)?drillButton(p.ref,'invoice',p.ref):esc(p.ref),
+    esc(p.method),esc(account(p.account)?.name||p.account),money(p.amount)]));
+}
+function drillDueAsOf(doc,type,date=today()) {
+  const later=db.payments.filter(p=>p.ref===doc.id && p.type===type && p.date>date).reduce((sum,p)=>sum+p.amount,0);
+  return r2((type==='received'?invoiceDue(doc):billDue(doc))+later);
+}
+function drillBalanceNote(balance,details) {
+  const gap=r2(balance-details);
+  return `<p>Ledger balance <strong>${money(balance)}</strong> · Open documents ${money(details)}${gap?
+    ' · Difference '+money(gap)+' (including any opening balances or separate journal postings)':''}</p>`;
+}
+function performanceMetric(key) {
+  const label=PERFORMANCE_METRICS[key];
+  if (!label) return;
+  const date=today(), month=ui.performanceMonth || date.slice(0,7), d=performanceData(month);
+  const posted=db.gl.filter(e=>e.date<=date);
+  const period=e=>e.date<=date && e.date.startsWith(month+'-');
+  let intro='', content='';
+  if (['revenue','expense','profit'].includes(key)) {
+    const types=key==='profit'?['Revenue','Expense']:[key==='revenue'?'Revenue':'Expense'];
+    intro=`<p>Reporting month ${esc(month)} · ${money(d[key])}</p>`;
+    content=drillJournal(posted.filter(period),l=>types.includes(account(l.code)?.type));
+  } else if (key==='receipts') {
+    intro=`<p>Reporting month ${esc(month)} · ${money(d.receipts)}</p>`;
+    content=drillReceipts(db.payments.filter(p=>p.type==='received' && period(p)));
+  } else if (key==='cash') {
+    const codes=['1000','1010','1020'];
+    intro=drillTable(['Cash or bank account','Balance'],codes.map(code=>[esc(account(code)?.name||code),money(acctBalance(code,date))]));
+    content=drillJournal(posted,l=>codes.includes(l.code));
+  } else if (key==='ar' || key==='overdue') {
+    const due=i=>drillDueAsOf(i,'received',date);
+    const invoices=db.invoices.filter(i=>i.date<=date && due(i)>0 && (key==='ar' || i.dueDate<date));
+    const total=invoices.reduce((sum,i)=>sum+due(i),0);
+    intro=key==='ar'?drillBalanceNote(d.ar,total):`<p>Overdue as of ${date} · ${money(total)}</p>`;
+    content=drillInvoices(invoices,due)+(key==='ar'?`<details><summary>Receivables ledger postings</summary>${drillJournal(posted,l=>l.code==='1100')}</details>`:'');
+  } else if (key==='ap') {
+    const due=b=>drillDueAsOf(b,'made',date);
+    const bills=db.bills.filter(b=>b.date<=date && due(b)>0);
+    intro=drillBalanceNote(d.ap,bills.reduce((sum,b)=>sum+due(b),0));
+    content=drillTable(['Bill','Vendor','Issued','Due date','Total','Outstanding'],bills.map(b=>[
+      drillButton(b.id,'bill',b.id),esc(vendorName(b.vendorId)),esc(b.date),esc(b.dueDate),money(b.total),money(due(b))]))+
+      `<details><summary>Payables ledger postings</summary>${drillJournal(posted,l=>l.code==='2000')}</details>`;
+  } else if (key==='retention') {
+    intro=`<p>Retention receivable as of ${date} · ${money(d.retention)}</p>`;
+    content=drillJournal(posted,l=>l.code===RETENTION_ACCOUNT);
+  } else if (key==='utilization') {
+    content=drillTable(['Equipment','Fleet units','Out on rent','Available'],db.items.filter(i=>i.type==='Rental').map(i=>[
+      drillButton(i.name,'fleetItem',i.id),i.qty,i.onRent||0,i.qty-(i.onRent||0)]));
+  } else if (key==='overdueRentals') {
+    content=performanceRentals(db.rentals.filter(rentalOverdue));
+  } else {
+    content=drillTable(['SKU','Item','On hand','Reorder point','Stock value'],db.items.filter(i=>i.type==='Inventory' && i.qty<=i.reorder).map(i=>[
+      esc(i.sku),drillButton(i.name,'item',i.id),i.qty,i.reorder,money(stockValue(i))]));
+  }
+  performanceDetail(label,intro+content,()=>performanceMetric(key));
+}
+function performanceRentals(records) {
+  return drillTable(['Agreement','Customer','Checked out','Due','Equipment'],records.map(r=>[
+    drillButton(r.id,'rental',r.id),esc(customerName(r.customerId)),esc(r.dateOut),esc(r.dueDate),
+    esc(r.lines.map(l=>itemName(l.itemId)+' × '+l.qty).join(', '))]));
+}
+function performanceDetail(title,body,reopen) {
+  ui.performanceReturn=reopen;
+  openModal(title,body,`<button class="btn ghost" onclick="closeModal()">Back to dashboard</button>`,'wide');
+}
+function performanceSource(type,id) {
+  const back=ui.performanceReturn;
+  if (!back) return;
+  if (type==='invoice') showInvoice(id);
+  else if (type==='bill') showBill(id);
+  else if (type==='rental') showRental(id);
+  else if (type==='project') showProject(id);
+  else if (type==='journal') {
+    const e=db.gl.find(entry=>entry.id===id);
+    if (!e) return;
+    openModal('Journal entry '+(e.ref||''),`<p>${esc(e.date)} · ${esc(e.source)} · ${esc(e.memo)}</p>`+
+      drillTable(['Account','Project','Debit','Credit'],e.lines.map(l=>[esc(l.code+' · '+(account(l.code)?.name||'')),
+        esc(job(l.projectId)?.name||''),money(l.debit),money(l.credit)])),'','wide');
+  } else {
+    const item=db.items.find(i=>i.id===id);
+    if (!item) return;
+    const details=drillTable(['SKU','Category','Unit','Quantity','Unit cost','Selling price','Reorder point'],[[
+      esc(item.sku),esc(item.category),esc(item.unit),item.qty,money(item.cost),money(item.price),item.reorder]]);
+    const rentals=type==='fleetItem' ? `<p>On rent ${item.onRent||0} · Available ${item.qty-(item.onRent||0)}</p>`+
+      performanceRentals(db.rentals.filter(r=>r.status==='Out' && r.lines.some(l=>l.itemId===id))) : '';
+    openModal(item.name,details+rentals,'','wide');
+  }
+  const footer=document.querySelector?.('#modalRoot .modal-f');
+  if (footer) footer.insertAdjacentHTML('afterbegin','<button class="btn ghost" onclick="returnPerformanceDetail()">Back to details</button>');
+}
+function returnPerformanceDetail() {
+  ui.performanceReturn?.();
+}
+function drillProjectCosts(id) {
+  const f=projectFigures(id,today()), refs=new Set([...f.invoices,...f.bills].map(i=>i.id));
+  return drillJournal(db.gl.filter(e=>e.date<=today()),(l,e)=>account(l.code)?.type==='Expense' &&
+    (['Sales','COGS','Purchase'].includes(e.source) && refs.has(e.ref) ||
+    e.source==='Job Materials' && e.ref===id || e.source==='Caribbean Payroll' && l.projectId===id));
+}
+function projectPerformanceMetric(key,id) {
+  const p=job(id);
+  if (!p) return;
+  const c=jobCommercial(p), f=projectFigures(id,today());
+  const invoices=[...c.invoices,...c.releases].filter(i=>i.date<=today());
+  const refs=new Set(invoices.map(i=>i.id));
+  let label='', body='';
+  if (key==='contract') {
+    label='Revised contract';
+    body=constructionPanel(p);
+  } else if (key==='billed') {
+    label='Billed ex tax'; body=drillInvoices(c.invoices.filter(i=>i.date<=today()));
+  } else if (key==='cash') {
+    label='Cash received'; body=drillReceipts(db.payments.filter(x=>x.type==='received' && x.date<=today() && refs.has(x.ref)));
+  } else if (key==='due') {
+    label='Trade due'; body=drillInvoices(invoices.filter(i=>drillDueAsOf(i,'received')>0),i=>drillDueAsOf(i,'received'));
+  } else if (key==='retention') {
+    label='Retention held'; body=drillJournal(db.gl.filter(e=>refs.has(e.ref) && e.date<=today()),l=>l.code===RETENTION_ACCOUNT);
+  } else {
+    label=key==='margin'?'Billed margin':'Actual cost';
+    body=`<p>Billed ex tax ${money(f.billed)} · Actual job costs ${money(f.costs)} · Billed margin ${money(f.margin)}</p>`+
+      (key==='margin'?drillInvoices(c.invoices.filter(i=>i.date<=today())):'')+drillProjectCosts(id);
+  }
+  performanceDetail(p.name+' · '+label,`<p>${drillButton('Open project','project',p.id)}</p>`+body,()=>projectPerformanceMetric(key,id));
+}
+function evmPerformanceMetric(key,id,packageId) {
+  const p=job(id), plan=p && evmPlan(p);
+  if (!plan || !EVM_METRICS[key]) return;
+  const e=evmMetrics(p,projectFigures(id,today()).costs);
+  const [name,formula]=EVM_METRICS[key];
+  const packages=plan.packages.filter(w=>!packageId || w.id===packageId);
+  const details=drillTable(['Work package','Start','Finish','Budget','Planned value','Physical progress','Earned value','Evidence'],packages.map(w=>{
+    const progress=p.evm.progress[w.id], values=evmPackageValues(w,progress,today());
+    return [esc(w.name),esc(w.start),esc(w.finish),money(w.budget),money(values.pv),(progress?.percent||0)+'%',money(values.ev),esc(progress?.evidence||'—')];
+  }));
+  const history=packageId ? drillTable(['Date','Baseline','Previous','New','Evidence'],p.evm.updates.flatMap(u=>u.changes
+    .filter(c=>c.id===packageId).map(c=>[esc(u.date),esc(u.baseline),c.previous+'%',c.percent+'%',esc(u.evidence)]))) : '';
+  performanceDetail(p.name+' · '+(packageId ? packages[0]?.name||name : name),
+    `<p>${esc(formula)}${packageId?'':' · <strong>'+(key==='cpi'||key==='spi'?reportIndex(e[key]):reportAmount(e[key]))+'</strong>'}</p>`+
+    (packageId?'':`<p>PV ${money(e.pv)} · EV ${money(e.ev)} · AC ${money(e.ac)} · Baseline ${esc(plan.ref)}</p>`)+details+history+
+    (!packageId && ['ac','cv','cpi','eac','etc','vac'].includes(key)?`<h4>Posted job costs</h4>${drillProjectCosts(id)}`:''),
+    ()=>evmPerformanceMetric(key,id,packageId));
 }
 
 (function boot() {
