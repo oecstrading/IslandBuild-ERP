@@ -175,6 +175,15 @@
   .performance-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
   .performance-tabs [aria-pressed="true"]{background:#0c4a6e;color:white}
   .metric-drill .card-b{display:block}
+  .guide-trigger{width:22px;height:22px;border:1px solid #94a3b8;border-radius:50%;background:#f0f9ff;color:#075985;font:bold 12px system-ui;cursor:pointer;vertical-align:middle;margin-left:6px;padding:0}
+  .guide-trigger:hover,.guide-trigger:focus-visible{outline:2px solid #0284c7;outline-offset:2px}
+  .guided-metric{position:relative;display:grid;min-width:0}
+  .guided-metric .metric-drill{padding-right:28px}
+  .guided-metric>.guide-trigger{position:absolute;right:9px;top:9px}
+  #platformGuide{position:fixed;inset:auto;margin:0;z-index:3000;max-width:calc(100vw - 16px);width:320px;background:#0f2940;color:#f8fafc;border:1px solid #32516c;border-radius:10px;padding:12px 14px;box-shadow:0 8px 24px #0f172a45}
+  #platformGuide[hidden]{display:none}
+  #platformGuide p{margin:6px 0 0;line-height:1.5}
+  #platformGuideClose{float:right;background:transparent;border:0;color:inherit;font-size:18px;cursor:pointer}
 </style>
 </head>
 <body>
@@ -188,7 +197,7 @@
   </aside>
   <main>
     <header class="topbar">
-      <h2 id="pageTitle">Dashboard</h2>
+      <div style="display:flex;align-items:center"><h2 id="pageTitle">Dashboard</h2><span id="pageGuide"></span></div>
       <div class="meta">
         <span class="ai-badge"><span class="dot"></span>AI Accountant</span>
         <span id="coName">IslandBuild Construction & Equipment Ltd</span>
@@ -202,6 +211,10 @@
 </div>
 <button id="aiFab" onclick="go('ai')" title="Ask the AI Accountant">🤖</button>
 <div id="modalRoot"></div>
+<div id="platformGuide" popover="manual" role="region" aria-labelledby="platformGuideTitle" hidden>
+  <button id="platformGuideClose" type="button" aria-label="Close help" onclick="dismissGuide()">×</button>
+  <strong id="platformGuideTitle"></strong><p id="platformGuideText"></p>
+</div>
 <div id="toast"></div>
 
 <script>
@@ -769,7 +782,10 @@ function render() {
     const search = document.activeElement;
     const filterFocused = search?.matches('.search') && v.contains(search);
     const caret = filterFocused ? search.selectionStart : null;
+    closeGuide();
+    document.getElementById('pageGuide').innerHTML=guideMarkup(titles[route]||'Dashboard',MODULE_GUIDANCE[route]||MODULE_GUIDANCE.dashboard);
     v.innerHTML = fn();
+    attachGuidance(v);
     if (filterFocused) {
       const next = v.querySelector('.search');
       next?.focus();
@@ -825,10 +841,10 @@ function viewDashboard() {
 
     return `
     <div class="grid g4" style="margin-bottom:16px">
-      <div class="card kpi blue"><div class="lbl">Cash & Bank</div><div class="val">${money(cash)}</div><div class="sub">Cash on hand + Republic Bank</div></div>
-      <div class="card kpi green"><div class="lbl">Accounts Receivable</div><div class="val">${money(ar)}</div><div class="sub">${(db.invoices || []).filter(i => invoiceDue(i) > 0).length} open invoices</div></div>
-      <div class="card kpi red"><div class="lbl">Accounts Payable</div><div class="val">${money(ap)}</div><div class="sub">${(db.bills || []).filter(b => billDue(b) > 0).length} open bills</div></div>
-      <div class="card kpi amber"><div class="lbl">Inventory Value</div><div class="val">${money(invValue)}</div><div class="sub">At weighted cost</div></div>
+      <div class="card kpi blue"><div class="lbl">Cash & Bank${guideMarkup('Cash & Bank','Current cash on hand and bank balance. Reconcile it against bank and cash records.')}</div><div class="val">${money(cash)}</div><div class="sub">Cash on hand + Republic Bank</div></div>
+      <div class="card kpi green"><div class="lbl">Accounts Receivable${guideMarkup('Accounts Receivable','Customer balances still due. Review the aging report to prioritize collections.')}</div><div class="val">${money(ar)}</div><div class="sub">${(db.invoices || []).filter(i => invoiceDue(i) > 0).length} open invoices</div></div>
+      <div class="card kpi red"><div class="lbl">Accounts Payable${guideMarkup('Accounts Payable','Supplier balances outstanding. Check due dates before scheduling payments.')}</div><div class="val">${money(ap)}</div><div class="sub">${(db.bills || []).filter(b => billDue(b) > 0).length} open bills</div></div>
+      <div class="card kpi amber"><div class="lbl">Inventory Value${guideMarkup('Inventory Value','The cost of stock on hand using weighted-average unit cost. Compare physical counts with the stock valuation report.')}</div><div class="val">${money(invValue)}</div><div class="sub">At weighted cost</div></div>
     </div>
 
     <div class="grid" style="grid-template-columns:1.55fr 1fr;margin-bottom:16px">
@@ -1940,12 +1956,14 @@ function resetDemo() {
 
 /* ============================= MODAL HELPERS =============================== */
 function openModal(title, body, footer, size) {
+  closeGuide();
   const root = document.getElementById('modalRoot');
   root.innerHTML = `<div class="modal ${size || ''}"><div class="modal-h"><h3>${esc(title)}</h3><button class="x" onclick="closeModal()">×</button></div>
     <div class="modal-b">${body}</div><div class="modal-f">${footer || '<button class="btn ghost" onclick="closeModal()">Close</button>'}</div></div>`;
+  attachGuidance(root);
   root.classList.add('on'); root.onclick = e => { if (e.target === root) closeModal(); };
 }
-function closeModal() { const root = document.getElementById('modalRoot'); root.classList.remove('on'); root.innerHTML = ''; }
+function closeModal() { closeGuide(); const root = document.getElementById('modalRoot'); root.classList.remove('on'); root.innerHTML = ''; }
 
 /* ==========================================================================
    ██  AI ACCOUNTANT ASSISTANT  ██
@@ -3741,10 +3759,14 @@ function viewPerformance() {
   const tab=ui.performanceTab || 'business';
   const tabBar=`<nav class="performance-tabs" aria-label="Performance views">${Object.entries(PERFORMANCE_TABS).map(([name,label])=>
     `<button class="btn-sm" id="performance-tab-${name}" aria-pressed="${tab===name}" onclick="performanceTab('${name}')">${label}</button>`).join('')}</nav>`;
-  const card=(key,value,evm=false)=>`<button class="card metric-drill" onclick="${evm?
-    `evmPerformanceMetric('${key}','${selected.p.id}')`:`performanceMetric('${key}')`}"><span class="card-b">
-    <span class="muted">${evm?EVM_METRICS[key][0]:PERFORMANCE_METRICS[key]}</span><br>
-    <strong style="font-size:22px">${value}</strong></span></button>`;
+  const card=(key,value,evm=false)=>{
+    const title=evm?EVM_METRICS[key][0]:PERFORMANCE_METRICS[key];
+    const help=evm?EVM_METRICS[key][1]+' '+evmReadout(key,selected.evm):KPI_GUIDANCE[key];
+    const action=evm?`evmPerformanceMetric('${key}','${selected.p.id}')`:`performanceMetric('${key}')`;
+    return `<div class="guided-metric"><button class="card metric-drill" onclick="${action}"><span class="card-b">
+      <span class="muted">${esc(title)}</span><br><strong style="font-size:22px">${value}</strong>
+    </span></button>${guideMarkup(title,help)}</div>`;
+  };
   const measure=(key,id,value,evm=false)=>`<button class="btn-sm" aria-label="${esc((evm?
     EVM_METRICS[key][0]:key[0].toUpperCase()+key.slice(1))+' for '+job(id).name+' · '+value)}" onclick="${evm?'evmPerformanceMetric':'projectPerformanceMetric'}('${key}','${id}')">${value}</button>`;
   const row=(cells)=>`<tr>${cells.map(value=>`<td>${value}</td>`).join('')}</tr>`;
@@ -3936,7 +3958,7 @@ function performanceMetric(key) {
     content=drillTable(['SKU','Item','On hand','Reorder point','Stock value'],db.items.filter(i=>i.type==='Inventory' && i.qty<=i.reorder).map(i=>[
       esc(i.sku),drillButton(i.name,'item',i.id),i.qty,i.reorder,money(stockValue(i))]));
   }
-  performanceDetail(label,intro+content,()=>performanceMetric(key));
+  performanceDetail(label,`<p class="muted">${esc(KPI_GUIDANCE[key])}</p>`+intro+content,()=>performanceMetric(key));
 }
 function performanceRentals(records) {
   return drillTable(['Agreement','Customer','Checked out','Due','Equipment'],records.map(r=>[
@@ -4020,6 +4042,7 @@ function evmPerformanceMetric(key,id,packageId) {
     .filter(c=>c.id===packageId).map(c=>[esc(u.date),esc(u.baseline),c.previous+'%',c.percent+'%',esc(u.evidence)]))) : '';
   performanceDetail(p.name+' · '+(packageId ? packages[0]?.name||name : name),
     `<p>${esc(formula)}${packageId?'':' · <strong>'+(key==='cpi'||key==='spi'?reportIndex(e[key]):reportAmount(e[key]))+'</strong>'}</p>`+
+    (packageId?'':`<p><strong>What this means</strong> · ${esc(evmReadout(key,e))}</p>`)+
     (packageId?'':`<p>PV ${money(e.pv)} · EV ${money(e.ev)} · AC ${money(e.ac)} · Baseline ${esc(plan.ref)}</p>`)+details+history+
     (!packageId && ['ac','cv','cpi','eac','etc','vac'].includes(key)?`<h4>Posted job costs</h4>${drillProjectCosts(id)}`:''),
     ()=>evmPerformanceMetric(key,id,packageId));
@@ -4127,6 +4150,185 @@ function demoAccess() {
     ? '<span class="pill info">Sample workspace</span> <a class="btn-sm" href="?">Return to main workspace</a>'
     : '<a class="btn-sm" href="?demo=1" target="_blank" rel="noopener noreferrer">Open sample workspace</a>';
 }
+
+/* Contextual guidance is read-only and does not affect postings. */
+const MODULE_GUIDANCE = {
+  dashboard:'Start with overdue invoices and rentals, then review the Performance Dashboard for the transactions behind the totals.',
+  performance:'Choose Business performance for monthly results, Cash & operations for today’s balances, Construction portfolio for job financials, or Earned value for physical delivery. Click any metric card to open its supporting records.',
+  ai:'Ask for an explanation of a balance, project, or outlier. Verify the answer against the linked source records before using it to make accounting decisions.',
+  pos:'Check quantities, taxable items, the amount tendered and the payment method. Completing the sale records the receipt and reduces stock for inventory items.',
+  invoices:'An unpaid invoice contributes to trade receivables. Balance due excludes amounts already collected and construction retention still withheld.',
+  customers:'Review who owes money before extending credit. Customer records support sales, rentals and collections.',
+  receipts:'This register shows customer payments received. Open the original invoice to check how the payment affected its balance.',
+  bills:'Enter supplier invoices and their due dates here. A stock purchase updates inventory. A job-coded expense contributes to actual project cost.',
+  vendors:'Keep supplier terms and contact details current. Select the correct vendor when entering a bill.',
+  disbursements:'This register records payments against vendor bills. Check the payment date and bank or cash account against the source record.',
+  projects:'Start with contract terms, scope, costs and dates. Use approved variations to change a signed baseline. Record completion, final billing and release of retention in their respective stages.',
+  inventory:'On-hand quantity drives availability. Compare it with the reorder point, and use stock adjustments or supplier bills to maintain the stock ledger.',
+  rentals:'Check out available equipment, record deposits and check equipment back in to calculate rental charges. The deposit is held until applied or refunded.',
+  fleet:'Units out divided by total fleet units shows current utilization. Check active rental agreements to see when equipment is expected back.',
+  coa:'The account type controls where a balance appears in the financial statements. Use consistent accounts when recording comparable transactions.',
+  journal:'Review the debits and credits for each event. References link postings to the invoice, bill, project or other record that generated them.',
+  trial:'Total debits should equal total credits. A balanced trial balance alone cannot detect an omitted transaction or an entry posted to the wrong account.',
+  statements:'The income statement shows recorded revenue and expenses. The balance sheet shows assets, liabilities and equity. Review the ledger and supporting documents for unusual balances.',
+  reports:'Select a report and check its date or month before interpreting totals. Use aging for collections and payments, and the tax worksheet to review ledger postings before filing.',
+  imports:'Choose the import type, use its template, and review the preview before posting. Keep a backup before importing opening balances or a new payroll batch.',
+  settings:'Review company and tax settings before posting invoices. Export a backup before replacing company data. Use the separate sample workspace when testing.'
+};
+const HEADING_GUIDANCE = {
+  'Revenue — Last 6 Months':'Compares posted sales revenue by month. It measures activity recorded in the ledger rather than customer payments.',
+  'Open Rentals':'Equipment still checked out. A red overdue count means the agreed return date has passed.',
+  'Recent Invoices':'The latest sales invoices in the ledger. Open the invoice to check its charges and amount still due.',
+  'Work schedule':'Record who owns each task and when it is due. A billable milestone needs a client acceptance reference before it can be completed and invoiced.',
+  'Work packages':'EVM weights physical progress by each package’s approved budget, so completing a small task earns less value than completing a large one.',
+  'Baseline and progress history':'Use approval references to trace baseline revisions. Progress history shows the evidence used to update measured completion.',
+  'Contract lifecycle':'The workflow moves from signed contract to certified billing, sign-off, final account, retention release and closeout. Open billing rows for balances and receipts.',
+  'Project baseline and controls':'Compare the original approval with the latest authorized budget and finish date. Estimate to complete plus posted cost gives the project manager’s forecast, which can differ from the EVM forecast.',
+  'Approved variations':'Use a signed change to revise contract value, budget or finish date. The original baseline remains available for comparison.',
+  'Billing, retention and collections':'Separate the amount invoiced, the retention withheld, and the money actually received. Click a document to inspect its details.',
+  'Materials issued':'Materials issued to the project reduce stock and add to actual job cost. Their issue date determines when they appear in project cost reporting.',
+  'Linked transactions':'Invoices and vendor bills tied to this job support billing and cost reconciliation. Unassigned transactions require review before interpreting job margins.',
+  'Reporting month':'Sets the period for revenue, expenses and receipts. Cash and operations cards describe today’s balances and activity.',
+  'Income Statement':'Compare revenue and expenses for the period. Profit includes transactions posted on credit and can differ from cash collected.',
+  'Balance Sheet':'Shows financial position on the report date. Use account and subledger details to explain balances.',
+  'Monthly VAT & HSL Ledger Worksheet':'Shows VAT and HSL recorded for the selected month. Check that the taxable supplies, periods and exemptions match the underlying documents.',
+  'Payroll account mapping':'Map gross pay and employer charges to expense accounts and amounts withheld or owed to liability accounts. Review project allocations before posting.',
+  'Import history':'Shows which files were posted. Use the payroll run reference to identify a batch already recorded.',
+  'Rental Rates':'The daily, weekly and monthly charges are applied according to the time used. Deposits are tracked separately from rental revenue.',
+  'Current Sale':'Change quantities in the cart before taking payment. Taxes are based on each item’s sales eligibility.'
+};
+const FIELD_GUIDANCE = {
+  term_value:'The signed selling price before VAT and HSL. It sets the ceiling for billing until an approved variation changes it.',
+  term_retention:'Percentage withheld from the pre-tax amount of a construction certificate. It stays in retention receivable until released for collection.',
+  term_cap:'Maximum retention to withhold across the contract. A blank or zero value means there is no separate cap.',
+  term_paymentDays:'Calendar days from the certificate date. IslandBuild uses this to suggest the invoice due date.',
+  term_retentionDays:'Calendar days from the retention release date. IslandBuild uses this to suggest the due date for collecting released retention.',
+  term_defectsDays:'Minimum calendar days after sign-off before the retention release can be scheduled.',
+  term_contingency:'Reserve included in the approved cost budget. It is excluded from the EVM work-package baseline.',
+  term_etc:'Current management estimate of costs still to incur. Add it to actual cost to get the project manager’s forecast final cost.',
+  term_billing:'Progress certificates use certified amounts. Accepted milestones require recorded client acceptance and can only be billed once.',
+  term_evmEvidence:'Enter an inspection or measurement reference that supports the cumulative physical progress reported.',
+  term_evmRef:'Use the authorization reference for the approved work-package budget and schedule.',
+  term_evmReason:'Explain the approved change that justifies revising this baseline. Earlier approved versions remain in history.',
+  term_taskBilling:'Value of this milestone before taxes. A zero value means the task is for scheduling only.',
+  term_taskApproval:'Enter the client acceptance document or sign-off reference before marking a billable milestone complete.',
+  lcDue:'Review the suggested date against the contract and certificate or release terms.',
+  lcAmount:'Enter the incremental amount for this action. For progress billing use newly certified work, excluding amounts billed earlier.',
+  coHslEnabled:'Enables the levy on sales lines that are marked eligible. Confirm eligibility before posting.',
+  coHslVat:'When selected, the levy is included in the value used to calculate VAT.',
+  itTax:'Determines whether sales of the item are taxable for VAT by default.',
+  itHsl:'Marks the item as potentially subject to the levy when HSL is enabled.',
+  itReorder:'At or below this on-hand quantity, the item appears in the low-stock report.',
+  itDep:'The refundable amount collected at checkout per unit. It is tracked as a deposit liability.',
+  importDate:'Controls when the imported balances or payroll appear in the ledger.',
+  importEmployer:'Enter the approved employer contribution when the source file omits it. Use zero only when confirmed.',
+  importRun:'Use the unique reference for the approved payroll batch. An already posted reference will be rejected.'
+};
+const KPI_GUIDANCE = {
+  revenue:'Revenue recognized in the selected month from posting entries. Compare it with customer receipts to see how much recorded activity has translated into cash.',
+  expense:'Costs recorded in the selected month. Inspect larger postings and check whether costs have been assigned to the proper jobs.',
+  profit:'Revenue less expenses for the selected month. A negative result means recorded expenses exceed recorded revenue.',
+  receipts:'Payments recorded from customers in the month. These may relate to invoices from earlier months.',
+  cash:'Cash and bank ledger balances today. Reconcile them to cash counts and bank statements before relying on the total.',
+  ar:'Trade receivables still in the ledger. Compare the open invoices with the ledger balance and prioritize collections by due date.',
+  overdue:'Invoices with unpaid amounts past their due dates. Open the list to see which customers and accounts require follow-up.',
+  ap:'Supplier amounts in the trade payables ledger. Review open bills and payment dates when planning cash needs.',
+  retention:'Construction amounts withheld by customers and still held as retention. When released, the balance moves to trade receivables for collection.',
+  utilization:'Units currently rented out divided by total fleet units. A high result can mean limited capacity to fill a new booking.',
+  overdueRentals:'Equipment agreements with units still out after the return date. Open the agreement to confirm expected return and follow up.',
+  lowStock:'Items at or below their reorder points. Check planned purchases and the work schedule before ordering more.'
+};
+function evmReadout(key,e) {
+  const value=e?.[key];
+  if (value==null) return 'No result yet. Check that an approved baseline, progress and the relevant cost or planned value are available.';
+  if (key==='cpi') return value===1?'Each dollar spent has earned one dollar of budgeted work.':
+    'The job has earned '+money(value)+' of budgeted work for each EC$1.00 spent. '+(value<1?'Cost efficiency is below plan.':'Cost efficiency is above plan.');
+  if (key==='spi') return value===1?'Budget-weighted progress matches the plan as of today.':
+    'The job has earned '+(value*100).toFixed(0)+'% of the planned value due by today. '+(value<1?'Progress is behind plan.':'Progress is ahead of plan.');
+  if (key==='cv' || key==='sv') return value===0?'Earned value matches '+(key==='cv'?'actual cost.':'planned value.'):
+    money(Math.abs(value))+' of budgeted work '+(key==='cv'?(value<0?'less than actual cost.':'more than actual cost.'):
+      (value<0?'behind the schedule plan.':'ahead of the schedule plan.'));
+  if (key==='vac') return value===0?'Forecast cost equals the approved work budget.':
+    'Forecast cost is '+money(Math.abs(value))+(value<0?' above':' below')+' the approved work budget.';
+  if (key==='etc') return 'The forecast expects '+money(value)+' of additional spending to finish the approved work.';
+  if (key==='eac') return 'The forecast puts final cost at '+money(value)+'. While work remains, this assumes current cost efficiency continues.';
+  if (key==='ac') return 'Posted job costs through today total '+money(value)+'. Compare with earned value to judge cost efficiency.';
+  if (key==='ev') return 'The measured work completed is worth '+money(value)+' at its approved budget rates.';
+  if (key==='pv') return 'The baseline planned '+money(value)+' of budgeted work to be complete by today.';
+  return 'The approved work-package budget totals '+money(value)+' before contingency.';
+}
+function guideMarkup(title,content) {
+  return `<button type="button" class="guide-trigger" data-guide-title="${esc(title)}" data-guide-text="${esc(content)}"
+    aria-label="Help: ${esc(title)}" aria-controls="platformGuide" aria-expanded="false">?</button>`;
+}
+let guideAnchor=null, guidePinned=false;
+function closeGuide() {
+  const panel=document.getElementById('platformGuide');
+  if (typeof panel?.hidePopover==='function' && panel.matches(':popover-open')) panel.hidePopover();
+  if (panel) panel.hidden=true;
+  guideAnchor?.setAttribute('aria-expanded','false');
+  guideAnchor=null; guidePinned=false;
+}
+function dismissGuide() {
+  const anchor=guideAnchor;
+  if (anchor && document.activeElement!==anchor) anchor.focus();
+  closeGuide();
+}
+function openGuide(anchor,pin=false) {
+  if (!anchor || (guidePinned && !pin)) return;
+  const panel=document.getElementById('platformGuide');
+  if (!panel) return;
+  if (pin && guidePinned && guideAnchor===anchor) { closeGuide(); return; }
+  closeGuide();
+  guideAnchor=anchor; guidePinned=pin;
+  anchor.setAttribute('aria-expanded','true');
+  document.getElementById('platformGuideTitle').textContent=anchor.dataset.guideTitle;
+  document.getElementById('platformGuideText').textContent=anchor.dataset.guideText;
+  panel.hidden=false;
+  if (typeof panel.showPopover==='function') panel.showPopover();
+  const box=anchor.getBoundingClientRect();
+  panel.style.left=Math.max(8,Math.min(box.left,window.innerWidth-panel.offsetWidth-8))+'px';
+  const below=box.bottom+8;
+  panel.style.top=(below+panel.offsetHeight<=window.innerHeight ? below : Math.max(8,box.top-panel.offsetHeight-8))+'px';
+}
+function attachGuidance(root) {
+  if (!root?.querySelectorAll) return;
+  for (const heading of root.querySelectorAll('h3,h4,.sec-title,summary')) {
+    const name=heading.textContent.trim(), text=HEADING_GUIDANCE[name];
+    if (!text || heading.parentElement?.querySelector(':scope > .guide-trigger')) continue;
+    if (heading.tagName==='SUMMARY') heading.insertAdjacentHTML('afterend',guideMarkup(name,text));
+    else heading.insertAdjacentHTML('beforeend',guideMarkup(name,text));
+  }
+  for (const [id,text] of Object.entries(FIELD_GUIDANCE)) {
+    const field=root.querySelector('#'+id);
+    const label=field?.closest('.field')?.querySelector('label') || field?.closest('label');
+    if (!label || label.nextElementSibling?.classList.contains('guide-trigger')) continue;
+    label.insertAdjacentHTML('afterend',guideMarkup(label.textContent.trim(),text));
+  }
+}
+document.addEventListener?.('click',event=>{
+  const button=event.target.closest?.('.guide-trigger');
+  if (button) { openGuide(button,true); return; }
+  if (!event.target.closest?.('#platformGuide')) closeGuide();
+});
+document.addEventListener?.('pointerover',event=>{
+  const button=event.target.closest?.('.guide-trigger');
+  if (button && event.pointerType==='mouse' && button!==guideAnchor) openGuide(button);
+});
+document.addEventListener?.('pointerout',event=>{
+  if (!guidePinned && event.target===guideAnchor && event.pointerType==='mouse') closeGuide();
+});
+document.addEventListener?.('focusin',event=>{
+  if (event.target.matches?.('.guide-trigger')) openGuide(event.target);
+});
+document.addEventListener?.('focusout',event=>{
+  if (!guidePinned && event.target===guideAnchor) closeGuide();
+});
+document.addEventListener?.('keydown',event=>{
+  if (event.key==='Escape' && guideAnchor) {
+    dismissGuide();
+  }
+});
 
 (function boot() {
   try {
