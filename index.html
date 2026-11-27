@@ -1022,33 +1022,50 @@ function viewInvoices() {
 }
 function newInvoiceModal() {
   openModal('New Sales Invoice', `
-    <div class="row">
-      <div class="field"><label class="fl">Customer</label><select class="inp" id="invCustomer">${(db.customers||[]).filter(c => c.id !== 'CUST-005').map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></div>
+    <div id="invWizard">
+    <ol id="invSteps" aria-label="Invoice progress" style="display:flex;flex-wrap:wrap;gap:10px 28px;padding-left:24px;margin:0 0 16px">
+      <li>Customer and dates</li><li>Invoice lines</li><li>Review and post</li>
+    </ol>
+    <p id="invHelp" style="background:#eff6ff;padding:12px;border-radius:7px"></p>
+    <p id="invIssue" role="alert" style="color:#b91c1c" hidden></p>
+    <section id="invStep1"><div class="row">
+      <div class="field"><label class="fl" for="invCustomer">Customer</label><select class="inp" id="invCustomer"><option value="">Choose a customer</option>${(db.customers||[]).filter(c => c.id !== 'CUST-005').map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></div>
       <div class="field"><label class="fl">Invoice Date</label><input class="inp" id="invDate" type="date" value="${today()}"></div>
       <div class="field"><label class="fl">Due Date</label><input class="inp" id="invDue" type="date" value="${dayShift(30)}"></div>
     </div>
-    ${projectPicker('invProject')}
+    ${projectPicker('invProject')}</section>
+    <section id="invStep2" hidden>
     <div class="sec-title">Line Items</div>
     <table><thead><tr><th style="width:44%">Item / Description</th><th style="width:12%">Qty</th><th style="width:16%">Rate</th><th class="num" style="width:16%">Amount</th><th style="width:6%"></th></tr></thead>
     <tbody id="invLines"></tbody></table>
     <button class="btn-sm" style="margin-top:10px" onclick="addInvLineRow()">+ Add Line</button>
     <div style="margin-top:16px;margin-left:auto;max-width:300px">
       ${invoiceTaxRows(salesTaxes([]), 'style="display:flex;justify-content:space-between;padding:5px 0"', true)}</div>
-  `, `<button class="btn ghost" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveInvoice()">Save & Post Invoice</button>`, 'wide');
-  addInvLineRow(); addInvLineRow();
+    </section><section id="invStep3" hidden></section></div>
+  `, `<button class="btn ghost" onclick="closeModal()">Cancel</button>
+    <button class="btn ghost" id="invBack" onclick="showInvoiceStep(invoiceStep - 1)">Back</button>
+    <button class="btn" id="invNext" onclick="advanceInvoice()">Continue</button>`, 'wide');
+  addInvLineRow();
+  document.getElementById('invWizard').addEventListener('input', event => {
+    event.target.removeAttribute('aria-invalid');
+    event.target.removeAttribute('aria-describedby');
+    document.getElementById('invIssue').hidden = true;
+  });
+  showInvoiceStep(1);
 }
 function itemOptionsHTML(sel) { return `<option value="">— free text —</option>` + (db.items||[]).map(i => `<option value="${i.id}" ${i.id === sel ? 'selected' : ''}>${esc(i.sku)} · ${esc(i.name)}</option>`).join(''); }
 function addInvLineRow() {
   const tb = document.getElementById('invLines'); const tr = document.createElement('tr');
-  tr.innerHTML = `<td><select class="inp line-item" onchange="lineItemChange(this)">${itemOptionsHTML()}</select>
-      <input class="inp line-desc" placeholder="Description" style="margin-top:5px;font-size:12px">
+  tr.innerHTML = `<td><select class="inp line-item" aria-label="Item" onchange="lineItemChange(this)">${itemOptionsHTML()}</select>
+      <input class="inp line-desc" aria-label="Description" placeholder="Description" style="margin-top:5px;font-size:12px">
       <label><input type="checkbox" class="line-vat" checked onchange="recalcInvoice()"> VAT taxable</label>
       <label><input type="checkbox" class="line-hsl" onchange="recalcInvoice()"> HSL eligible</label></td>
-    <td><input class="inp line-qty" type="number" min="0" step="0.01" value="1" oninput="recalcInvoice()"></td>
-    <td><input class="inp line-rate" type="number" min="0" step="0.01" value="0" oninput="recalcInvoice()"></td>
+    <td><input class="inp line-qty" aria-label="Quantity" type="number" min="0" step="0.01" value="1" oninput="recalcInvoice()"></td>
+    <td><input class="inp line-rate" aria-label="Unit price" type="number" min="0" step="0.01" oninput="recalcInvoice()"></td>
     <td class="num line-amt" style="font-weight:600">EC$0.00</td>
-    <td><button class="btn-sm danger" onclick="this.closest('tr').remove();recalcInvoice()">✕</button></td>`;
+    <td><button class="btn-sm danger" aria-label="Remove line" onclick="this.closest('tr').remove();recalcInvoice()">✕</button></td>`;
   tb.appendChild(tr);
+  tr.querySelector('.line-item').focus();
 }
 function lineItemChange(sel) {
   const tr = sel.closest('tr'); const item = db.items.find(i => i.id === sel.value);
@@ -1070,19 +1087,116 @@ function recalcInvoice() {
   for (const [id,key] of Object.entries({invSub:'subtotal',invHsl:'hsl',invVatBase:'vatBase',invVat:'vat',invTotal:'total'}))
     document.getElementById(id).textContent = money(totals[key]);
 }
-function saveInvoice() {
-  const lines = [];
-  document.querySelectorAll('#invLines tr').forEach(tr => {
-    const itemId = tr.querySelector('.line-item').value;
-    const desc = tr.querySelector('.line-desc').value || (itemId ? itemName(itemId) : '');
-    const qty = num(tr.querySelector('.line-qty').value); const rate = num(tr.querySelector('.line-rate').value);
-    if (!desc || qty <= 0) return;
-    const item = db.items.find(i => i.id === itemId);
-    lines.push({ itemId, desc, qty, rate, taxable: tr.querySelector('.line-vat').checked, hslEligible: tr.querySelector('.line-hsl').checked, revAcct: item ? item.revAcct : '4010', cogsAcct: item ? item.cogsAcct : '5000', cost: item ? item.cost : 0 });
+let invoiceStep = 1;
+function showInvoiceStep(step, focus = true) {
+  invoiceStep = step;
+  document.querySelectorAll('#invSteps li').forEach((item, index) => {
+    const active = index + 1 === step;
+    item.style.fontWeight = active ? '700' : '400';
+    if (active) item.setAttribute('aria-current', 'step');
+    else item.removeAttribute('aria-current');
+    document.getElementById('invStep' + (index + 1)).hidden = !active;
   });
-  if (!lines.length) return toast('Add at least one line', 'bad');
-  const inv = createInvoice({ customerId: val('invCustomer'), date: val('invDate'), dueDate: val('invDue'), projectId: val('invProject'), lines, source: 'AR' });
-  closeModal(); render(); toast('Invoice ' + inv.id + ' posted', 'ok');
+  document.querySelectorAll('#invWizard [aria-invalid]').forEach(field => {
+    field.removeAttribute('aria-invalid');
+    field.removeAttribute('aria-describedby');
+  });
+  const help = document.getElementById('invHelp');
+  help.textContent = [
+    'Choose who will receive this invoice. Check when it is issued and when payment is due.',
+    'Add the goods or services you are charging for. Enter the quantity and unit price for each line, then check its tax settings.',
+    'Check the customer, dates, charges and taxes. Use Back to make changes. Posting records the invoice in your sales and accounting records.'
+  ][step - 1];
+  document.getElementById('invIssue').hidden = true;
+  document.getElementById('invBack').hidden = step === 1;
+  document.getElementById('invNext').textContent = step === 3 ? 'Post invoice' : 'Continue';
+  if (focus) {
+    help.tabIndex = -1;
+    help.focus();
+  }
+}
+
+function invoiceIssue(step, message, field) {
+  showInvoiceStep(step, false);
+  const alert = document.getElementById('invIssue');
+  alert.hidden = false;
+  alert.textContent = message;
+  alert.tabIndex = -1;
+  if (field) {
+    field.setAttribute('aria-invalid', 'true');
+    field.setAttribute('aria-describedby', 'invIssue');
+    field.focus();
+  } else alert.focus();
+}
+
+function advanceInvoice() {
+  const customer = db.customers.find(c => c.id === val('invCustomer'));
+  const date = val('invDate');
+  const dueDate = val('invDue');
+  const projectId = val('invProject');
+  const project = (db.projects || []).find(p => p.id === projectId);
+  const detailsIssue = (message, id) => invoiceIssue(1, message, document.getElementById(id));
+  if (!customer) return detailsIssue('Choose the customer who will receive this invoice.', 'invCustomer');
+  if (!validDate(date)) return detailsIssue('Enter a valid invoice date.', 'invDate');
+  if (!validDate(dueDate) || dueDate < date)
+    return detailsIssue('Enter a due date on or after the invoice date.', 'invDue');
+  if (projectId && project?.customerId !== customer.id)
+    return detailsIssue('Choose a project for this customer, or select No project if this sale is unrelated.', 'invProject');
+  if (project?.contract)
+    return detailsIssue('Open this project’s Contract lifecycle panel to bill certified work.', 'invProject');
+  if (invoiceStep === 1) return showInvoiceStep(2);
+
+  const lines = [];
+  const demand = new Map();
+  const rows = [...document.querySelectorAll('#invLines tr')];
+  if (!rows.length) return invoiceIssue(2, 'Select Add Line and enter at least one charge.');
+  for (const [index, row] of rows.entries()) {
+    const field = name => row.querySelector('.line-' + name);
+    const issue = (message, name) => invoiceIssue(2, 'Line ' + (index + 1) + '. ' + message, field(name));
+    const itemId = field('item').value;
+    const item = db.items.find(i => i.id === itemId);
+    const desc = field('desc').value.trim();
+    const qty = field('qty').valueAsNumber;
+    const rate = field('rate').valueAsNumber;
+    if (itemId && !item) return issue('Choose an available item.', 'item');
+    if (item?.type === 'Rental') return issue('Use Rental Agreements to bill this equipment.', 'item');
+    if (!desc) return issue('Enter what you are charging for, or remove this line.', 'desc');
+    if (!Number.isFinite(qty) || qty <= 0) return issue('Enter a quantity greater than zero.', 'qty');
+    if (!Number.isFinite(rate) || rate < 0 || !Number.isFinite(qty * rate))
+      return issue('Enter a valid unit price of zero or more.', 'rate');
+    if (item?.type === 'Inventory') {
+      const requested = r2((demand.get(itemId) || 0) + qty);
+      if (requested > item.qty)
+        return issue('Reduce the combined quantity for ' + item.name + ' to the available stock of ' + item.qty + '.', 'qty');
+      demand.set(itemId, requested);
+    }
+    lines.push({itemId, desc, qty, rate, taxable:field('vat').checked, hslEligible:field('hsl').checked,
+      revAcct:item?.revAcct || '4010', cogsAcct:item?.cogsAcct || '5000', cost:item?.cost || 0});
+  }
+  if (invoiceStep === 2) {
+    document.getElementById('invStep3').innerHTML = `
+      <p><strong>${esc(customer.name)}</strong> · ${esc(project?.name || 'No project')}</p>
+      <p>Invoice date <strong>${esc(date)}</strong> · Payment due <strong>${esc(dueDate)}</strong></p>
+      <div style="overflow-x:auto"><table>
+      <thead><tr><th>Description</th><th>Quantity</th><th>Unit price</th><th>VAT</th><th>HSL</th><th>Amount</th></tr></thead>
+      <tbody>${lines.map(line => `<tr><td>${esc(line.desc)}</td><td>${line.qty}</td>
+        <td>${money(line.rate)}</td><td>${line.taxable ? 'Yes' : 'No'}</td><td>${line.hslEligible ? 'Yes' : 'No'}</td>
+        <td>${money(r2(line.qty * line.rate))}</td></tr>`).join('')}</tbody></table></div>
+      <div style="margin:16px 0 0 auto;max-width:300px">
+        ${invoiceTaxRows(salesTaxes(lines), 'style="display:flex;justify-content:space-between;padding:5px 0"')}
+      </div>`;
+    return showInvoiceStep(3);
+  }
+
+  let invoice;
+  try {
+    invoice = atomic(() => createInvoice({customerId:customer.id, date, dueDate, projectId, lines, source:'AR'}));
+  } catch (error) {
+    return invoiceIssue(3, 'Invoice could not be posted. ' + error.message);
+  }
+  closeModal();
+  render();
+  toast('Invoice ' + invoice.id + ' posted', 'ok');
 }
 function payInvoiceModal(id) {
   const inv = db.invoices.find(i => i.id === id); const bal = invoiceDue(inv);
